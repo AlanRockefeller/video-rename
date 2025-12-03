@@ -129,7 +129,10 @@ def get_exif_data(file_path):
     try:
         result = subprocess.run(
             ['exiftool', '-json', '-n', str(file_path)],
-            capture_output=True, text=True, check=True
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            universal_newlines=True,
+            check=True,
         )
         # exiftool returns a list with one JSON object
         return json.loads(result.stdout)[0]
