@@ -1,6 +1,5 @@
 # Video Renamer
 
-
 # By Alan Rockefeller
 # Version 1.0
 # November 29, 2025
@@ -99,3 +98,12 @@ The script will process files with the following extensions (case-insensitive):
 - `.mpeg`
 
 
+## License
+
+This project is licensed under the MIT License - see the [LICENSE.md](LICENSE.md) file for details.
+
+## Contact
+
+Contact me if you have any issues or suggestions for improvement - My email address is my full name at gmail, or message me on Facebook, Linkedin or Instagram
+
+Project Link: [https://github.com/AlanRockefeller/video-rename](https://github.com/AlanRockefeller/video-rename)

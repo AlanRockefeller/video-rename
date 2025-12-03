@@ -179,14 +179,18 @@ def process_file(file_path, dry_run, debug, is_recursive, base_dir):
     """
     stem = file_path.stem
     
-    # Check if filename already contains a location (case-insensitive)
-    original_stem_parts = stem.replace('-', ' ').replace('_', ' ').split()
-    found_loc = None
-    for part in original_stem_parts:
-        if part.lower() in ALL_LOCATIONS:
-            found_loc = part
-            break
     
+    # Check if filename already contains a location (case-insensitive).
+    # Normalize by treating '-' and '_' as spaces and also checking a compact
+    # form with spaces removed so that both "Costa Rica" and "CostaRica" match.
+    normalized_stem = stem.replace('-', ' ').replace('_', ' ').lower()
+    normalized_compact = normalized_stem.replace(' ', '')
+    found_loc = None
+    for loc in ALL_LOCATIONS:
+        if loc in normalized_stem or loc.replace(' ', '') in normalized_compact:
+            found_loc = loc
+            break
+
     if found_loc:
         print(f"[NOTICE] Skipping {file_path.name}: Already contains location '{found_loc}'.")
         return
@@ -236,7 +240,7 @@ def process_file(file_path, dry_run, debug, is_recursive, base_dir):
 
     # Determine display name for original file
     original_display_name = str(file_path.name)
-    if is_recursive and base_dir and file_path.is_relative_to(base_dir):
+    if is_recursive and base_dir:
         try:
             original_display_name = str(file_path.relative_to(base_dir))
         except ValueError:
