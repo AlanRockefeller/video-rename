@@ -181,29 +181,12 @@ def process_file(file_path, dry_run, debug, is_recursive, base_dir):
     and performs the rename.
     """
     stem = file_path.stem
-    
-    
-    # Check if filename already contains a location (case-insensitive).
-    # Normalize by treating '-' and '_' as spaces and also checking a compact
-    # form with spaces removed so that both "Costa Rica" and "CostaRica" match.
-    normalized_stem = stem.replace('-', ' ').replace('_', ' ').lower()
-    normalized_compact = normalized_stem.replace(' ', '')
-    found_loc = None
-    for loc in ALL_LOCATIONS:
-        if loc in normalized_stem or loc.replace(' ', '') in normalized_compact:
-            found_loc = loc
-            break
-
-    if found_loc:
-        print(f"[NOTICE] Skipping {file_path.name}: Already contains location '{found_loc}'.")
-        return
-
     exif_data = get_exif_data(file_path)
 
     # 1. Determine orientation
     width = exif_data.get('ImageWidth')
     height = exif_data.get('ImageHeight')
-    
+
     rotation_val = exif_data.get('Rotation')
     rotation = None
     if rotation_val is not None:
@@ -221,25 +204,55 @@ def process_file(file_path, dry_run, debug, is_recursive, base_dir):
     latitude = exif_data.get('GPSLatitude')
     longitude = exif_data.get('GPSLongitude')
     location_str = get_location_info(latitude, longitude)
-    
+
     # 3. Construct new name
     ext = file_path.suffix
-    
     components = [stem]
+
+    # Add location if it's determined and not already in the stem
     if location_str:
-        components.append(location_str)
-    
+        has_location = False
+        # Normalize stem for checking: lowercase and remove separators
+        test_stem = stem.lower().replace('-', '').replace('_', '')
+
+        # Check for presence of the determined location
+        if location_str.lower().replace('_', '') in test_stem:
+            has_location = True
+        else:
+            # Check for full state/country names for robustness
+            if location_str.startswith("USA_"):
+                abbr = location_str.split('_')[1]
+                state_name = ""
+                for k, v in US_STATES.items():
+                    if v == abbr:
+                        state_name = k.lower().replace(' ', '')
+                        break
+                if state_name and state_name in test_stem:
+                    has_location = True
+            else:  # Country
+                country_name_nospaces = location_str.lower()
+                country_name_spaces = ""
+                for c in COUNTRY_NAMES:
+                    if c.replace(' ', '') == country_name_nospaces:
+                        country_name_spaces = c
+                        break
+                if country_name_spaces and country_name_spaces in stem.lower().replace('_', ' ').replace('-', ' '):
+                    has_location = True
+
+        if not has_location:
+            components.append(location_str)
+
     # Check if orientation already exists in the stem (case-insensitive)
     stem_lower = stem.lower()
     if "_horizontal" not in stem_lower and "_vertical" not in stem_lower:
         components.append(orientation)
-    
+
     new_stem = "_".join(components)
 
     new_path = file_path.with_name(new_stem + ext)
 
     if new_path == file_path:
-        return # No change needed
+        return  # No change needed
 
     # Determine display name for original file
     original_display_name = str(file_path.name)
