@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+"""Rename video files based on GPS location and orientation from EXIF metadata."""
 
 # video_rename.py version 1.0 by Alan Rockefeller
 # November 29, 2025
@@ -285,7 +286,7 @@ COUNTRY_NAMES = {
     "zimbabwe",
 }
 # Only check for full state names (e.g., "California"), not abbreviations ("CA").
-STATE_NAMES = {name.lower() for name in US_STATES.keys()}
+STATE_NAMES = {name.lower() for name in US_STATES}
 ALL_LOCATIONS = COUNTRY_NAMES | STATE_NAMES
 
 
@@ -374,23 +375,28 @@ def get_orientation(width, height, rotation=None):
     return "horizontal"
 
 
+def _is_video_file(path):
+    """Returns True if path is a file with a recognized video extension."""
+    return path.is_file() and path.suffix.lower() in VIDEO_EXTENSIONS
+
+
 def get_video_files(paths, recursive):
     """Yields all video files from the given paths."""
     for path_str in paths:
         path = Path(path_str)
         if path.is_file():
-            if path.suffix.lower() in VIDEO_EXTENSIONS:
+            if _is_video_file(path):
                 yield path
         elif path.is_dir():
             if recursive:
                 for dirpath, _, filenames in os.walk(path):
                     for filename in filenames:
                         file_path = Path(dirpath) / filename
-                        if file_path.suffix.lower() in VIDEO_EXTENSIONS:
+                        if _is_video_file(file_path):
                             yield file_path
-            else:  # Not recursive, so only top-level
+            else:
                 for item in path.iterdir():
-                    if item.is_file() and item.suffix.lower() in VIDEO_EXTENSIONS:
+                    if _is_video_file(item):
                         yield item
 
 
@@ -421,7 +427,8 @@ def process_file(file_path, dry_run, debug, is_recursive, base_dir):
 
     if debug:
         print(
-            f"[DEBUG] file: {file_path.name}, width: {width}, height: {height}, rotation: {rotation}, orientation: {orientation}"
+            f"[DEBUG] file: {file_path.name}, width: {width}, height: {height}, "
+            f"rotation: {rotation}, orientation: {orientation}"
         )
 
     # 2. Determine location
