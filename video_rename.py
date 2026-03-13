@@ -6,6 +6,7 @@
 
 import argparse
 import os
+import re
 import subprocess
 import json
 import shutil
@@ -85,210 +86,6 @@ US_STATES = {
     "Puerto Rico": "PR",
     "United States Virgin Islands": "VI",
 }
-
-# --- Location Constants for Filename Checking ---
-# All names are stored in lowercase for case-insensitive matching.
-COUNTRY_NAMES = {
-    "afghanistan",
-    "albania",
-    "algeria",
-    "andorra",
-    "angola",
-    "antigua and barbuda",
-    "argentina",
-    "armenia",
-    "australia",
-    "austria",
-    "azerbaijan",
-    "bahamas",
-    "bahrain",
-    "bangladesh",
-    "barbados",
-    "belarus",
-    "belgium",
-    "belize",
-    "benin",
-    "bhutan",
-    "bolivia",
-    "bosnia and herzegovina",
-    "botswana",
-    "brazil",
-    "brunei",
-    "bulgaria",
-    "burkina faso",
-    "burundi",
-    "cabo verde",
-    "cambodia",
-    "cameroon",
-    "canada",
-    "central african republic",
-    "chad",
-    "chile",
-    "china",
-    "colombia",
-    "comoros",
-    "congo",
-    "costa rica",
-    "côte d'ivoire",
-    "croatia",
-    "cuba",
-    "cyprus",
-    "czechia",
-    "denmark",
-    "djibouti",
-    "dominica",
-    "dominican republic",
-    "ecuador",
-    "egypt",
-    "el salvador",
-    "equatorial guinea",
-    "eritrea",
-    "estonia",
-    "eswatini",
-    "ethiopia",
-    "fiji",
-    "finland",
-    "france",
-    "gabon",
-    "gambia",
-    "georgia",
-    "germany",
-    "ghana",
-    "greece",
-    "grenada",
-    "guatemala",
-    "guinea",
-    "guinea-bissau",
-    "guyana",
-    "haiti",
-    "holy see",
-    "honduras",
-    "hungary",
-    "iceland",
-    "india",
-    "indonesia",
-    "iran",
-    "iraq",
-    "ireland",
-    "israel",
-    "italy",
-    "jamaica",
-    "japan",
-    "jordan",
-    "kazakhstan",
-    "kenya",
-    "kiribati",
-    "kuwait",
-    "kyrgyzstan",
-    "laos",
-    "latvia",
-    "lebanon",
-    "lesotho",
-    "liberia",
-    "libya",
-    "liechtenstein",
-    "lithuania",
-    "luxembourg",
-    "madagascar",
-    "malawi",
-    "malaysia",
-    "maldives",
-    "mali",
-    "malta",
-    "marshall islands",
-    "mauritania",
-    "mauritius",
-    "mexico",
-    "micronesia",
-    "moldova",
-    "monaco",
-    "mongolia",
-    "montenegro",
-    "morocco",
-    "mozambique",
-    "myanmar",
-    "namibia",
-    "nauru",
-    "nepal",
-    "netherlands",
-    "new zealand",
-    "nicaragua",
-    "niger",
-    "nigeria",
-    "north korea",
-    "north macedonia",
-    "norway",
-    "oman",
-    "pakistan",
-    "palau",
-    "palestine",
-    "panama",
-    "papua new guinea",
-    "paraguay",
-    "peru",
-    "philippines",
-    "poland",
-    "portugal",
-    "qatar",
-    "romania",
-    "russia",
-    "rwanda",
-    "saint kitts and nevis",
-    "saint lucia",
-    "saint vincent and the grenadines",
-    "samoa",
-    "san marino",
-    "sao tome and principe",
-    "saudi arabia",
-    "senegal",
-    "serbia",
-    "seychelles",
-    "sierra leone",
-    "singapore",
-    "slovakia",
-    "slovenia",
-    "solomon islands",
-    "somalia",
-    "south africa",
-    "south korea",
-    "south sudan",
-    "spain",
-    "sri lanka",
-    "sudan",
-    "suriname",
-    "sweden",
-    "switzerland",
-    "syria",
-    "tajikistan",
-    "tanzania",
-    "thailand",
-    "timor-leste",
-    "togo",
-    "tonga",
-    "trinidad and tobago",
-    "tunisia",
-    "turkey",
-    "turkmenistan",
-    "tuvalu",
-    "uganda",
-    "ukraine",
-    "united arab emirates",
-    "united kingdom",
-    "united states",
-    "usa",
-    "uruguay",
-    "uzbekistan",
-    "vanuatu",
-    "venezuela",
-    "vietnam",
-    "yemen",
-    "zambia",
-    "zimbabwe",
-}
-# Only check for full state names (e.g., "California"), not abbreviations ("CA").
-STATE_NAMES = {name.lower() for name in US_STATES}
-ALL_LOCATIONS = COUNTRY_NAMES | STATE_NAMES
-
 
 # --- Geocoding ---
 
@@ -395,17 +192,102 @@ def get_video_files(paths, recursive):
         if path.is_file():
             if _is_video_file(path):
                 yield path
-        elif path.is_dir():
-            if recursive:
-                for dirpath, _, filenames in os.walk(path):
-                    for filename in filenames:
-                        file_path = Path(dirpath) / filename
-                        if _is_video_file(file_path):
-                            yield file_path
-            else:
-                for item in path.iterdir():
-                    if _is_video_file(item):
-                        yield item
+            continue
+        if not path.is_dir():
+            continue
+        if recursive:
+            for dirpath, _, filenames in os.walk(path, onerror=lambda e: print(
+                f"Warning: Cannot access directory: {e}"
+            )):
+                for filename in filenames:
+                    file_path = Path(dirpath) / filename
+                    if _is_video_file(file_path):
+                        yield file_path
+        else:
+            try:
+                entries = list(path.iterdir())
+            except OSError as e:
+                print(f"Warning: Cannot access directory {path}: {e}")
+                continue
+            for item in entries:
+                if _is_video_file(item):
+                    yield item
+
+
+# --- Helpers for process_file ---
+
+
+def _normalize_for_comparison(text):
+    """Lowercase and strip separators for case/separator-insensitive matching."""
+    return text.lower().replace("-", "").replace("_", "").replace(" ", "")
+
+
+def _parse_rotation(exif_data):
+    """Extract integer rotation from EXIF data, or None if unavailable."""
+    rotation_val = exif_data.get("Rotation")
+    if rotation_val is not None:
+        try:
+            return int(rotation_val)
+        except (ValueError, TypeError):
+            pass
+    return None
+
+
+def _stem_has_location(stem, location_str):
+    """Check whether the stem already contains the given location string."""
+    test_stem = _normalize_for_comparison(stem)
+
+    if _normalize_for_comparison(location_str) in test_stem:
+        return True
+
+    # For US locations, also check the full state name (e.g. "New Hampshire" for USA_NH)
+    if location_str.startswith("USA_"):
+        abbr = location_str.split("_")[1]
+        for state_name, state_abbr in US_STATES.items():
+            if state_abbr == abbr:
+                if _normalize_for_comparison(state_name) in test_stem:
+                    return True
+                break
+
+    return False
+
+
+_ORIENTATION_RE = re.compile(r"(?:^|[_\- ])(?:horizontal|vertical)(?:$|[_\- ])", re.IGNORECASE)
+
+
+def _stem_has_orientation(stem):
+    """Check whether the stem contains orientation as a distinct token.
+
+    Matches 'horizontal'/'vertical' bounded by start/end of string or common
+    filename separators (underscore, hyphen, space).  Does NOT match when the
+    word is embedded inside a larger word like 'verticalgarden'.
+    """
+    return _ORIENTATION_RE.search(stem) is not None
+
+
+def _build_new_path(file_path, location_str, orientation):
+    """Build the new file path with location and orientation appended."""
+    stem = file_path.stem
+    components = [stem]
+
+    if location_str and not _stem_has_location(stem, location_str):
+        components.append(location_str)
+
+    if not _stem_has_orientation(stem):
+        components.append(orientation)
+
+    new_stem = "_".join(components)
+    return file_path.with_name(new_stem + file_path.suffix)
+
+
+def _get_display_name(file_path, is_recursive, base_dir):
+    """Return a display name: relative path in recursive mode, filename otherwise."""
+    if is_recursive and base_dir:
+        try:
+            return str(file_path.relative_to(base_dir))
+        except ValueError:
+            pass
+    return str(file_path.name)
 
 
 # --- Main Logic ---
@@ -416,7 +298,6 @@ def process_file(file_path, dry_run, debug, is_recursive, base_dir):
     Processes a single video file: extracts metadata, determines the new name,
     and performs the rename.
     """
-    stem = file_path.stem
     exif_data = get_exif_data(file_path)
 
     if not exif_data:
@@ -426,15 +307,7 @@ def process_file(file_path, dry_run, debug, is_recursive, base_dir):
     # 1. Determine orientation
     width = exif_data.get("ImageWidth")
     height = exif_data.get("ImageHeight")
-
-    rotation_val = exif_data.get("Rotation")
-    rotation = None
-    if rotation_val is not None:
-        try:
-            rotation = int(rotation_val)
-        except (ValueError, TypeError):
-            rotation = None
-
+    rotation = _parse_rotation(exif_data)
     orientation = get_orientation(width, height, rotation)
 
     if debug:
@@ -444,71 +317,28 @@ def process_file(file_path, dry_run, debug, is_recursive, base_dir):
         )
 
     # 2. Determine location
-    latitude = exif_data.get("GPSLatitude")
-    longitude = exif_data.get("GPSLongitude")
-    location_str = get_location_info(latitude, longitude)
+    location_str = get_location_info(
+        exif_data.get("GPSLatitude"), exif_data.get("GPSLongitude")
+    )
 
-    # 3. Construct new name
-    ext = file_path.suffix
-    components = [stem]
-
-    # Add location if it's determined and not already in the stem
-    if location_str:
-        has_location = False
-        # Normalize stem for checking: lowercase and remove all separators (including spaces)
-        test_stem = stem.lower().replace("-", "").replace("_", "").replace(" ", "")
-
-        # Check for presence of the determined location
-        # Strip all separators to match test_stem normalization
-        location_normalized = (
-            location_str.lower().replace("_", "").replace("-", "").replace(" ", "")
-        )
-        if location_normalized in test_stem:
-            has_location = True
-        elif location_str.startswith("USA_"):
-            # Check for full state name (e.g. "New Hampshire" for USA_NH)
-            abbr = location_str.split("_")[1]
-            for k, v in US_STATES.items():
-                if v == abbr:
-                    state_normalized = k.lower().replace(" ", "").replace("-", "")
-                    if state_normalized in test_stem:
-                        has_location = True
-                    break
-
-        if not has_location:
-            components.append(location_str)
-
-    # Check if orientation already exists in the stem (case-insensitive)
-    stem_lower = stem.lower()
-    if "_horizontal" not in stem_lower and "_vertical" not in stem_lower:
-        components.append(orientation)
-
-    new_stem = "_".join(components)
-
-    new_path = file_path.with_name(new_stem + ext)
+    # 3. Construct new path
+    new_path = _build_new_path(file_path, location_str, orientation)
 
     if new_path == file_path:
         return  # No change needed
 
-    # Determine display name for original file
-    original_display_name = str(file_path.name)
-    if is_recursive and base_dir:
-        try:
-            original_display_name = str(file_path.relative_to(base_dir))
-        except ValueError:
-            # Fallback if file_path is not truly relative to base_dir
-            pass
-
     # 4. Perform rename
+    display_name = _get_display_name(file_path, is_recursive, base_dir)
+
     if dry_run:
-        print(f"[DRY] {original_display_name} → {new_path.name}")
+        print(f"[DRY] {display_name} → {new_path.name}")
     else:
         if new_path.exists():
             print(f"Warning: Destination file {new_path} already exists. Skipping.")
             return
         try:
             shutil.move(file_path, new_path)
-            print(f"[RENAME] {original_display_name} → {new_path.name}")
+            print(f"[RENAME] {display_name} → {new_path.name}")
         except OSError as e:
             print(f"Error: Failed to rename {file_path.name}. Reason: {e}")
 
@@ -596,7 +426,7 @@ Examples:
             process_file(
                 processed_file_path, args.dry_run, args.debug, args.recursive, base_dir
             )
-        except Exception as e:
+        except Exception as e:  # pylint: disable=broad-exception-caught  # batch guard: log and continue so one bad file doesn't abort the run
             print(
                 f"An unexpected error occurred while processing {file_path.name}: {e}"
             )
