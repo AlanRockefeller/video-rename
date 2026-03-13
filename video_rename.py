@@ -347,7 +347,7 @@ def get_exif_data(file_path):
         return {}
     try:
         result = subprocess.run(
-            [EXIFTOOL_PATH, "-json", "-n", str(file_path)],
+            [EXIFTOOL_PATH, "-json", "-n", "--", str(file_path)],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             universal_newlines=True,
@@ -414,6 +414,10 @@ def process_file(file_path, dry_run, debug, is_recursive, base_dir):
     """
     stem = file_path.stem
     exif_data = get_exif_data(file_path)
+
+    if not exif_data:
+        print(f"Skipping {file_path.name}: no EXIF data available.")
+        return
 
     # 1. Determine orientation
     width = exif_data.get("ImageWidth")
