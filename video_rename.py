@@ -331,6 +331,7 @@ def get_location_info(latitude, longitude):
             return result
     except (GeocoderTimedOut, GeocoderUnavailable, GeocoderServiceError) as e:
         print(f"Warning: Geocoding service error for {coords}: {e}")
+        GEOCODE_CACHE[coords] = None
         return None
 
     GEOCODE_CACHE[coords] = None
@@ -354,7 +355,10 @@ def get_exif_data(file_path):
             check=True,
         )
         # exiftool returns a list with one JSON object
-        return json.loads(result.stdout)[0]
+        data = json.loads(result.stdout)
+        if isinstance(data, list) and data and isinstance(data[0], dict):
+            return data[0]
+        return {}
     except (
         subprocess.CalledProcessError,
         FileNotFoundError,
