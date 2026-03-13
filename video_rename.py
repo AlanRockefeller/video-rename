@@ -292,6 +292,7 @@ ALL_LOCATIONS = COUNTRY_NAMES | STATE_NAMES
 
 # --- Geocoding ---
 
+EXIFTOOL_PATH = shutil.which("exiftool")
 GEOCODER = Nominatim(user_agent="video_renamer_cli")
 GEOCODE_CACHE = {}
 
@@ -341,9 +342,12 @@ def get_location_info(latitude, longitude):
 
 def get_exif_data(file_path):
     """Extracts EXIF data from a file using exiftool."""
+    if not EXIFTOOL_PATH:
+        print("Warning: exiftool not found. Cannot get EXIF data.")
+        return {}
     try:
         result = subprocess.run(
-            ["exiftool", "-json", "-n", str(file_path)],
+            [EXIFTOOL_PATH, "-json", "-n", str(file_path)],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             universal_newlines=True,
@@ -447,30 +451,21 @@ def process_file(file_path, dry_run, debug, is_recursive, base_dir):
         test_stem = stem.lower().replace("-", "").replace("_", "").replace(" ", "")
 
         # Check for presence of the determined location
-        if location_str.lower().replace("_", "") in test_stem:
+        # Strip all separators to match test_stem normalization
+        location_normalized = (
+            location_str.lower().replace("_", "").replace("-", "").replace(" ", "")
+        )
+        if location_normalized in test_stem:
             has_location = True
-        else:
-            # Check for full state/country names for robustness
-            if location_str.startswith("USA_"):
-                abbr = location_str.split("_")[1]
-                state_name = ""
-                for k, v in US_STATES.items():
-                    if v == abbr:
-                        state_name = k.lower().replace(" ", "")
-                        break
-                if state_name and state_name in test_stem:
-                    has_location = True
-            else:  # Country
-                country_name_nospaces = location_str.lower()
-                country_name_spaces = ""
-                for c in COUNTRY_NAMES:
-                    if c.replace(" ", "") == country_name_nospaces:
-                        country_name_spaces = c
-                        break
-                if country_name_spaces and country_name_spaces in stem.lower().replace(
-                    "_", " "
-                ).replace("-", " "):
-                    has_location = True
+        elif location_str.startswith("USA_"):
+            # Check for full state name (e.g. "New Hampshire" for USA_NH)
+            abbr = location_str.split("_")[1]
+            for k, v in US_STATES.items():
+                if v == abbr:
+                    state_normalized = k.lower().replace(" ", "").replace("-", "")
+                    if state_normalized in test_stem:
+                        has_location = True
+                    break
 
         if not has_location:
             components.append(location_str)
@@ -566,7 +561,7 @@ Examples:
 
     args = parser.parse_args()
 
-    if not shutil.which("exiftool"):
+    if not EXIFTOOL_PATH:
         print("Error: 'exiftool' is not installed or not in your system's PATH.")
         print("Please install it to use this script.")
         sys.exit(1)
@@ -599,6 +594,8 @@ Examples:
             print(
                 f"An unexpected error occurred while processing {file_path.name}: {e}"
             )
+            if args.debug:
+                raise
 
 
 if __name__ == "__main__":
