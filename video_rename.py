@@ -592,9 +592,7 @@ Examples:
         try:
             # Pass new arguments to process_file
             # Resolve file_path to absolute for consistent relative_to calculations in process_file
-            processed_file_path = (
-                file_path.resolve() if not file_path.is_absolute() else file_path
-            )
+            processed_file_path = file_path.resolve()
             process_file(
                 processed_file_path, args.dry_run, args.debug, args.recursive, base_dir
             )
