@@ -212,8 +212,8 @@ def process_file(file_path, dry_run, debug, is_recursive, base_dir):
     # Add location if it's determined and not already in the stem
     if location_str:
         has_location = False
-        # Normalize stem for checking: lowercase and remove separators
-        test_stem = stem.lower().replace('-', '').replace('_', '')
+        # Normalize stem for checking: lowercase and remove all separators (including spaces)
+        test_stem = stem.lower().replace('-', '').replace('_', '').replace(' ', '')
 
         # Check for presence of the determined location
         if location_str.lower().replace('_', '') in test_stem:
