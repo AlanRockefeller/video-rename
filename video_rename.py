@@ -1,21 +1,21 @@
 #!/usr/bin/env python3
 """Rename video files based on GPS location and orientation from EXIF metadata."""
 
-# video_rename.py version 1.0 by Alan Rockefeller
-# November 29, 2025
+# video_rename.py version 1.1 by Alan Rockefeller
+# March 30, 2026
 
 import argparse
+import json
 import os
 import re
-import subprocess
-import json
 import shutil
+import subprocess
 import sys
 from pathlib import Path
 
 try:
+    from geopy.exc import GeocoderServiceError, GeocoderTimedOut, GeocoderUnavailable
     from geopy.geocoders import Nominatim
-    from geopy.exc import GeocoderTimedOut, GeocoderUnavailable, GeocoderServiceError
 except ImportError:
     print(
         "Error: 'geopy' library not found. Please install it with 'pip install geopy'"
@@ -185,6 +185,11 @@ def _is_video_file(path):
     return path.is_file() and path.suffix.lower() in VIDEO_EXTENSIONS
 
 
+def _walk_error(err):
+    """Callback for os.walk: warn about inaccessible directories."""
+    print(f"Warning: Cannot access directory: {err}")
+
+
 def get_video_files(paths, recursive):
     """Yields all video files from the given paths."""
     for path_str in paths:
@@ -196,9 +201,7 @@ def get_video_files(paths, recursive):
         if not path.is_dir():
             continue
         if recursive:
-            for dirpath, _, filenames in os.walk(path, onerror=lambda e: print(
-                f"Warning: Cannot access directory: {e}"
-            )):
+            for dirpath, _, filenames in os.walk(path, onerror=_walk_error):
                 for filename in filenames:
                     file_path = Path(dirpath) / filename
                     if _is_video_file(file_path):
@@ -266,17 +269,27 @@ def _stem_has_orientation(stem):
 
 
 def _build_new_path(file_path, location_str, orientation):
-    """Build the new file path with location and orientation appended."""
+    """Build the new file path with location and orientation appended.
+
+    Preserves the existing stem and appends only missing components.
+    Append order is location first, then orientation, but existing tokens
+    in the stem are never moved or reordered.
+    """
     stem = file_path.stem
-    components = [stem]
+    need_location = bool(location_str) and not _stem_has_location(stem, location_str)
+    need_orientation = not _stem_has_orientation(stem)
 
-    if location_str and not _stem_has_location(stem, location_str):
-        components.append(location_str)
+    if not need_location and not need_orientation:
+        return file_path
 
-    if not _stem_has_orientation(stem):
-        components.append(orientation)
+    # Build suffix parts in canonical order: location then orientation
+    suffix_parts = []
+    if need_location:
+        suffix_parts.append(location_str)
+    if need_orientation:
+        suffix_parts.append(orientation)
 
-    new_stem = "_".join(components)
+    new_stem = stem + "_" + "_".join(suffix_parts)
     return file_path.with_name(new_stem + file_path.suffix)
 
 
@@ -330,12 +343,14 @@ def process_file(file_path, dry_run, debug, is_recursive, base_dir):
     # 4. Perform rename
     display_name = _get_display_name(file_path, is_recursive, base_dir)
 
-    if dry_run:
+    if new_path.exists():
+        if not dry_run:
+            print(f"Warning: Destination file {new_path} already exists. Skipping.")
+        else:
+            print(f"[DRY] {display_name} → SKIP (destination {new_path.name} already exists)")
+    elif dry_run:
         print(f"[DRY] {display_name} → {new_path.name}")
     else:
-        if new_path.exists():
-            print(f"Warning: Destination file {new_path} already exists. Skipping.")
-            return
         try:
             shutil.move(file_path, new_path)
             print(f"[RENAME] {display_name} → {new_path.name}")
@@ -345,7 +360,6 @@ def process_file(file_path, dry_run, debug, is_recursive, base_dir):
 
 def main():
     """Main function to parse arguments and orchestrate the renaming process."""
-
     # Custom help message for no-argument case
     if len(sys.argv) == 1:
         print("Usage: video_rename.py [PATH ...] [--recursive] [--dry-run] [--debug]")
@@ -420,8 +434,7 @@ Examples:
 
     for file_path in video_files:
         try:
-            # Pass new arguments to process_file
-            # Resolve file_path to absolute for consistent relative_to calculations in process_file
+            # Resolve file_path to absolute for consistent relative_to calculations
             processed_file_path = file_path.resolve()
             process_file(
                 processed_file_path, args.dry_run, args.debug, args.recursive, base_dir
