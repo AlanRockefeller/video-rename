@@ -447,5 +447,15 @@ Examples:
                 raise
 
 
+def run_cli():
+    """Run the command-line interface, handling user cancellation cleanly."""
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\nCancelled.", file=sys.stderr)
+        return 130
+    return 0
+
+
 if __name__ == "__main__":
-    main()
+    sys.exit(run_cli())

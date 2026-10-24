@@ -11,6 +11,7 @@ from video_rename import (
     _stem_has_orientation,
     get_orientation,
     process_file,
+    run_cli,
 )
 
 
@@ -264,3 +265,15 @@ class TestProcessFileDryRun:
         assert "Skipping" in out
         # Source should not have been moved
         assert src.exists()
+
+
+# --- command-line interruption handling ---
+
+
+class TestRunCli:
+    @patch("video_rename.main", side_effect=KeyboardInterrupt)
+    def test_keyboard_interrupt_exits_cleanly(self, _mock_main, capsys):
+        assert run_cli() == 130
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert captured.err == "\nCancelled.\n"
