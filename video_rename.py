@@ -811,7 +811,7 @@ async function deleteCurrent() {
     else if (scanComplete) finish();
     else waitForItem();
   } catch (error) {
-    $('message').textContent = error.message; setBusy(false); render();
+    setBusy(false); render(); $('message').textContent = error.message;
   }
 }
 async function refreshItems() {
