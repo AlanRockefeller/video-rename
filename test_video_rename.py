@@ -1,19 +1,32 @@
 """Tests for the pure helper functions in video_rename.py."""
 
+import json
 from pathlib import Path
+from threading import Event, Lock
+from types import SimpleNamespace
 from unittest.mock import patch
 
+import video_rename
 from video_rename import (
+    _audio_needs_browser_preview,
+    _browser_preview_path,
+    _build_descriptive_path,
     _build_new_path,
+    _description_parts,
+    _get_video_date,
+    _is_date_time_only_name,
     _normalize_for_comparison,
     _parse_rotation,
+    _prepare_review_item,
+    _sanitize_description,
+    _scan_review_items,
     _stem_has_location,
     _stem_has_orientation,
+    get_location_info,
     get_orientation,
     process_file,
     run_cli,
 )
-
 
 # --- get_orientation ---
 
@@ -219,6 +232,336 @@ class TestBuildNewPath:
         assert result == Path("/tmp/video_Mexico_vertical.MOV")
 
 
+# --- interactive description helpers ---
+
+
+class TestInteractiveDescriptionHelpers:
+    def test_camera_name_has_no_description(self):
+        assert _description_parts(
+            "IMG_1234_USA_CA_horizontal", None, "USA_CA", "horizontal"
+        ) == ("IMG_1234", "")
+
+    def test_generic_video_name_has_no_description(self):
+        assert _description_parts(
+            "video_001_USA_CA_horizontal", None, "USA_CA", "horizontal"
+        ) == ("video_001", "")
+
+    def test_phone_timestamp_name_has_no_description(self):
+        assert _description_parts(
+            "VID_20261024_143000_vertical", None, None, "vertical"
+        ) == ("VID_20261024_143000", "")
+
+    def test_repeated_date_and_time_name_has_no_description(self):
+        stem = "20251129-2025-11-29 19-04-15"
+        assert _is_date_time_only_name(stem) is True
+        assert _description_parts(stem, "2025-11-29", None, "horizontal") == (
+            stem,
+            "",
+        )
+
+    def test_words_after_date_are_a_description(self):
+        stem = "20251206-Alan_Tryptamine_Fingi_CO_1080p"
+        assert _is_date_time_only_name(stem) is False
+        assert _description_parts(stem, None, None, "horizontal") == (
+            "20251206",
+            "Alan Tryptamine Fingi CO 1080p",
+        )
+
+    def test_date_time_and_resolution_still_has_no_description(self):
+        assert _is_date_time_only_name("20251129_19-04-15_1080p") is True
+
+    def test_date_and_camera_id_still_has_no_description(self):
+        assert _is_date_time_only_name("20200503-DSC_8463") is True
+
+    def test_finds_description_after_camera_name(self):
+        assert _description_parts(
+            "IMG_1234_bear_eating_fish_2026-10-24_USA_CA_vertical",
+            "2026-10-24",
+            "USA_CA",
+            "vertical",
+        ) == ("IMG_1234", "bear eating fish")
+
+    def test_finds_saved_description_when_geocoding_is_unavailable(self):
+        assert _description_parts(
+            "IMG_1234_bear_fishing_2026-10-24_USA_CA_vertical",
+            "2026-10-24",
+            None,
+            "vertical",
+        ) == ("IMG_1234", "bear fishing")
+
+    def test_meaningful_name_is_an_existing_description(self):
+        assert _description_parts(
+            "otters_playing_USA_CA_horizontal", None, "USA_CA", "horizontal"
+        ) == ("", "otters playing")
+
+    def test_timestamp_name_has_no_description(self):
+        assert _description_parts(
+            "2026-10-24_12-30-22_horizontal",
+            "2026-10-24",
+            None,
+            "horizontal",
+        ) == ("2026-10-24_12-30-22", "")
+
+    def test_description_is_sanitized_for_filename(self):
+        assert (
+            _sanitize_description("  Bear / fishing: close-up  ")
+            == "Bear_fishing_close-up"
+        )
+
+    def test_builds_canonical_descriptive_name(self):
+        result = _build_descriptive_path(
+            Path("/tmp/IMG_1234.mp4"),
+            "Bear fishing",
+            "2026-10-24",
+            "USA_CA",
+            "vertical",
+            "IMG_1234",
+        )
+        assert result == Path(
+            "/tmp/IMG_1234_Bear_fishing_2026-10-24_USA_CA_vertical.mp4"
+        )
+
+    def test_does_not_append_date_when_compact_date_is_already_in_base(self):
+        result = _build_descriptive_path(
+            Path("/tmp/20130721-MVI_8811.MOV"),
+            "Oaxaca Cuajimoloyas fair",
+            "2013-07-21",
+            None,
+            "horizontal",
+            "20130721-MVI_8811",
+        )
+        assert result == Path(
+            "/tmp/20130721-MVI_8811_Oaxaca_Cuajimoloyas_fair_horizontal.MOV"
+        )
+
+    def test_description_is_required(self):
+        try:
+            _build_descriptive_path(
+                Path("/tmp/IMG_1234.mp4"), "  ", None, None, "horizontal"
+            )
+        except ValueError as error:
+            assert "description" in str(error)
+        else:
+            raise AssertionError("Expected a blank description to be rejected")
+
+    def test_date_uses_first_available_exif_tag(self):
+        assert _get_video_date({"CreateDate": "2026:10:24 14:30:00"}) == "2026-10-24"
+
+    def test_date_falls_back_to_filename(self):
+        assert _get_video_date({}, "clip_2026-10-24") == "2026-10-24"
+
+
+class TestBackgroundReviewScan:
+    @patch("video_rename._prepare_review_item")
+    def test_adds_only_undescribed_items_while_tracking_progress(self, prepare):
+        prepare.side_effect = [
+            {"description": "", "path": Path("first.mp4")},
+            {"description": "already named", "path": Path("second.mp4")},
+        ]
+        server = SimpleNamespace(
+            stop_event=Event(),
+            review_lock=Lock(),
+            review_items=[],
+            scan_progress=0,
+            scan_complete=False,
+        )
+
+        _scan_review_items(
+            server, [Path("first.mp4"), Path("second.mp4")], False, False
+        )
+
+        assert server.scan_progress == 2
+        assert server.scan_complete is True
+        assert len(server.review_items) == 1
+        assert server.review_items[0]["id"] == 0
+
+    @patch("video_rename._prepare_review_item")
+    def test_finish_stops_scanning_before_next_file(self, prepare):
+        stop_event = Event()
+        stop_event.set()
+        server = SimpleNamespace(
+            stop_event=stop_event,
+            review_lock=Lock(),
+            review_items=[],
+            scan_progress=0,
+            scan_complete=False,
+        )
+
+        _scan_review_items(server, [Path("first.mp4")], False, False)
+
+        prepare.assert_not_called()
+        assert server.scan_progress == 0
+
+
+class TestMetadataMinimization:
+    @patch("video_rename.get_exif_data")
+    def test_described_video_skips_exif_and_geocoding(self, get_exif):
+        item = _prepare_review_item(
+            Path("20251206-Alan_Tryptamine_Fingi_CO_1080p.m4v"),
+            0,
+            skip_metadata_if_described=True,
+        )
+
+        get_exif.assert_not_called()
+        assert item["description"] == "Alan Tryptamine Fingi CO 1080p"
+
+    @patch("video_rename.get_location_info", return_value="USA_CO")
+    @patch(
+        "video_rename.get_exif_data",
+        return_value={"ImageWidth": 1920, "ImageHeight": 1080},
+    )
+    def test_undescribed_video_reads_metadata(self, get_exif, get_location):
+        item = _prepare_review_item(
+            Path("20200503-DSC_8463.MOV"),
+            0,
+            skip_metadata_if_described=True,
+        )
+
+        get_exif.assert_called_once()
+        get_location.assert_called_once_with(None, None)
+        assert item["description"] == ""
+
+    @patch("video_rename.get_location_info")
+    @patch(
+        "video_rename.get_exif_data",
+        return_value={
+            "ImageWidth": 1920,
+            "ImageHeight": 1080,
+            "GPSLatitude": 46.786,
+            "GPSLongitude": -124.097,
+        },
+    )
+    def test_background_scan_defers_geocoding_until_review(
+        self, _get_exif, get_location
+    ):
+        item = _prepare_review_item(
+            Path("20200503-DSC_8463.MOV"),
+            0,
+            skip_metadata_if_described=True,
+            resolve_location=False,
+        )
+
+        get_location.assert_not_called()
+        assert item["latitude"] == 46.786
+        assert item["longitude"] == -124.097
+        assert item["location"] is None
+
+
+class TestBrowserAudioPreview:
+    @patch("video_rename.FFPROBE_PATH", "/usr/bin/ffprobe")
+    @patch("video_rename.subprocess.run")
+    def test_pcm_audio_needs_preview(self, run):
+        run.return_value = SimpleNamespace(
+            stdout=json.dumps({"streams": [{"codec_name": "pcm_s16le"}]})
+        )
+        assert _audio_needs_browser_preview(Path("clip.MOV")) is True
+
+    @patch("video_rename.FFPROBE_PATH", "/usr/bin/ffprobe")
+    @patch("video_rename.subprocess.run")
+    def test_aac_audio_uses_original(self, run):
+        run.return_value = SimpleNamespace(
+            stdout=json.dumps({"streams": [{"codec_name": "aac"}]})
+        )
+        assert _audio_needs_browser_preview(Path("clip.mp4")) is False
+
+    @patch("video_rename.FFMPEG_PATH", "/usr/bin/ffmpeg")
+    @patch("video_rename.FFPROBE_PATH", "/usr/bin/ffprobe")
+    @patch("video_rename._audio_needs_browser_preview", return_value=True)
+    @patch("video_rename.subprocess.run")
+    def test_preview_copies_video_and_converts_audio(
+        self, run, _needs_preview, tmp_path
+    ):
+        server = SimpleNamespace(
+            preview_dir=tmp_path,
+            preview_locks={},
+            preview_locks_lock=Lock(),
+            generated_previews=set(),
+        )
+        item = {"id": 3, "path": Path("clip.MOV")}
+
+        preview_path = _browser_preview_path(server, item)
+
+        assert preview_path == tmp_path / "video-3.mp4"
+        command = run.call_args.args[0]
+        assert command[command.index("-c:v") + 1] == "copy"
+        assert command[command.index("-c:a") + 1] == "aac"
+
+
+class TestGeocodingCourtesy:
+    @staticmethod
+    def _reset_geocoding(monkeypatch):
+        monkeypatch.setattr(video_rename, "GEOCODE_CACHE", {})
+        monkeypatch.setattr(video_rename, "_GEOCODE_CACHE_LOADED", True)
+        monkeypatch.setattr(video_rename, "_GEOCODE_COOLDOWN_UNTIL", 0.0)
+        monkeypatch.setattr(video_rename, "_GEOCODE_LAST_REQUEST", 0.0)
+        monkeypatch.setattr(video_rename, "GEOCODE_MIN_INTERVAL_SECONDS", 0)
+        monkeypatch.setattr(video_rename, "_save_geocode_cache", lambda: None)
+
+    def test_nearby_coordinates_share_cached_request(self, monkeypatch):
+        self._reset_geocoding(monkeypatch)
+        location = SimpleNamespace(
+            raw={
+                "address": {
+                    "country": "United States",
+                    "country_code": "us",
+                    "state": "Washington",
+                }
+            }
+        )
+        mock_reverse = patch.object(
+            video_rename.GEOCODER, "reverse", return_value=location
+        )
+        with mock_reverse as reverse_call:
+            first = get_location_info(46.7859, -124.0967)
+            second = get_location_info(46.7861, -124.0968)
+
+        assert first == second == "USA_WA"
+        reverse_call.assert_called_once()
+
+    def test_rate_limit_waits_then_retries(self, monkeypatch):
+        self._reset_geocoding(monkeypatch)
+        error = video_rename.GeocoderRateLimited("Too many requests", retry_after=7)
+        location = SimpleNamespace(
+            raw={"address": {"country": "Mexico", "country_code": "mx"}}
+        )
+        with (
+            patch.object(
+                video_rename.GEOCODER, "reverse", side_effect=[error, location]
+            ) as reverse,
+            patch("video_rename.time.sleep") as sleep,
+        ):
+            assert get_location_info(46.7, -124.1) == "Mexico"
+
+        assert reverse.call_count == 2
+        sleep.assert_called_once_with(7.0)
+
+    def test_repeated_rate_limit_uses_temporary_cooldown(self, monkeypatch):
+        self._reset_geocoding(monkeypatch)
+        monkeypatch.setattr(video_rename, "GEOCODE_MAX_RATE_LIMIT_RETRIES", 0)
+        error = video_rename.GeocoderServiceError("HTTP Error 429: Too many requests")
+        with patch.object(
+            video_rename.GEOCODER, "reverse", side_effect=error
+        ) as reverse:
+            assert get_location_info(46.7, -124.1) is None
+            assert get_location_info(47.7, -123.1) is None
+
+        reverse.assert_called_once()
+
+    def test_cache_survives_between_runs(self, monkeypatch, tmp_path):
+        cache_path = tmp_path / "geocode.json"
+        monkeypatch.setattr(video_rename, "_geocode_cache_path", lambda: cache_path)
+        monkeypatch.setattr(
+            video_rename, "GEOCODE_CACHE", {"46.786,-124.097": "USA_WA"}
+        )
+
+        video_rename._save_geocode_cache()
+        monkeypatch.setattr(video_rename, "GEOCODE_CACHE", {})
+        monkeypatch.setattr(video_rename, "_GEOCODE_CACHE_LOADED", False)
+        video_rename._load_geocode_cache()
+
+        assert video_rename.GEOCODE_CACHE == {"46.786,-124.097": "USA_WA"}
+
+
 # --- process_file dry-run ---
 
 
@@ -242,7 +585,9 @@ class TestProcessFileDryRun:
 
     @patch("video_rename.get_location_info", return_value="USA_CA")
     @patch("video_rename.get_exif_data", return_value=FAKE_EXIF)
-    def test_dry_run_skips_when_destination_exists(self, _mock_exif, _mock_loc, capsys, tmp_path):
+    def test_dry_run_skips_when_destination_exists(
+        self, _mock_exif, _mock_loc, capsys, tmp_path
+    ):
         src = tmp_path / "video.mp4"
         src.touch()
         dest = tmp_path / "video_USA_CA_horizontal.mp4"
@@ -254,7 +599,9 @@ class TestProcessFileDryRun:
 
     @patch("video_rename.get_location_info", return_value="USA_CA")
     @patch("video_rename.get_exif_data", return_value=FAKE_EXIF)
-    def test_real_run_skips_when_destination_exists(self, _mock_exif, _mock_loc, capsys, tmp_path):
+    def test_real_run_skips_when_destination_exists(
+        self, _mock_exif, _mock_loc, capsys, tmp_path
+    ):
         src = tmp_path / "video.mp4"
         src.touch()
         dest = tmp_path / "video_USA_CA_horizontal.mp4"
