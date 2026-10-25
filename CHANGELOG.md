@@ -12,6 +12,8 @@ not used Git tags, entries are grouped by commit date rather than release tag.
 - Added `--interactive` browser-based video review with native playback,
   seeking controls, live filename previews, skip/previous navigation, and
   keyboard shortcuts.
+- Added confirmed deletion from interactive review, with non-destructive
+  session-only behavior under `--dry-run`.
 - Added filename heuristics that distinguish descriptive names from camera
   identifiers, UUIDs, timestamps, and metadata-only names.
 - Added recording dates to interactive filenames when they are not already

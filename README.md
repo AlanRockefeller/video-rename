@@ -65,6 +65,8 @@ Useful controls:
 - `Ctrl+Enter`: rename and go to the next video
 - `Ctrl+Right Arrow`: skip to the next video
 - `Alt+Left/Right Arrow`: seek backward or forward five seconds
+- **Delete…**: permanently delete the current video after confirming its exact
+  filename (`--dry-run` only removes it from the current review)
 - **Open in video player**: use the system player when the browser does not
   support a video's codec
 

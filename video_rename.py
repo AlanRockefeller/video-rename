@@ -629,6 +629,8 @@ _INTERACTIVE_HTML = r"""<!doctype html>
     .actions { display:flex; flex-wrap:wrap; gap:10px; align-items:center; }
     button { border:1px solid #465064; border-radius:7px; padding:9px 14px; color:#edf2f8; background:#252b36; cursor:pointer; font-weight:600; }
     button:hover { background:#303847; } button.primary { background:#2968cc; border-color:#3d7de0; }
+    button.danger { color:#ffb1b1; border-color:#814848; }
+    button.danger:hover { background:#542a2f; }
     button:disabled { opacity:.45; cursor:default; }
     .hint { margin-left:auto; color:var(--muted); font-size:13px; }
     #message { min-height:22px; color:var(--danger); margin-top:10px; }
@@ -661,6 +663,7 @@ _INTERACTIVE_HTML = r"""<!doctype html>
         <button type="button" id="previous">← Previous</button>
         <button type="button" id="skip">Skip</button>
         <button type="button" class="primary" id="save">Rename &amp; next</button>
+        <button type="button" class="danger" id="delete">Delete…</button>
         <button type="button" id="finish">Finish</button>
         <span class="hint">Ctrl+Enter rename · Ctrl+→ skip · Alt+←/→ seek</span>
       </div>
@@ -676,7 +679,8 @@ _INTERACTIVE_HTML = r"""<!doctype html>
 </main>
 <script>
 const $ = id => document.getElementById(id);
-let items = [], position = 0, busy = false, scanComplete = false;
+let items = [], position = 0, busy = false, scanComplete = false, dryRun = false;
+const knownItemIds = new Set();
 let scanned = 0, total = 0, stopped = false, pollTimer = null;
 function cleanDescription(value) {
   return value.trim().replace(/[<>:"/\\|?*\x00-\x1f]/g, ' ')
@@ -753,7 +757,8 @@ function next() {
 }
 function setBusy(value) {
   busy = value; $('save').disabled = value; $('skip').disabled = value;
-  $('finish').disabled = value; $('previous').disabled = value || position === 0;
+  $('delete').disabled = value; $('finish').disabled = value;
+  $('previous').disabled = value || position === 0;
 }
 async function renameCurrent() {
   if (busy) return;
@@ -774,13 +779,37 @@ async function finish() {
   stopped = true; clearTimeout(pollTimer); $('video').pause(); completeView();
   try { await fetch('/api/finish', {method:'POST'}); } catch (_) {}
 }
+async function deleteCurrent() {
+  if (busy || position >= items.length) return;
+  const item = items[position];
+  const prompt = dryRun
+    ? `Remove “${item.current_name}” from this review?\n\nDry-run mode will not delete the file.`
+    : `Permanently delete “${item.current_name}”?\n\nThis cannot be undone.`;
+  if (!window.confirm(prompt)) return;
+  setBusy(true); $('message').textContent = '';
+  const video = $('video'); video.pause(); video.removeAttribute('src'); video.load();
+  try {
+    const response = await fetch('/api/delete', {method:'POST', headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({id:item.id})});
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.error || 'Delete failed');
+    items.splice(position, 1); setBusy(false);
+    if (position < items.length) render();
+    else if (scanComplete) finish();
+    else waitForItem();
+  } catch (error) {
+    $('message').textContent = error.message; setBusy(false); render();
+  }
+}
 async function refreshItems() {
   if (stopped) return;
   try {
     const response = await fetch('/api/items');
     const data = await response.json();
-    data.items.forEach(item => { if (!items.some(existing => existing.id === item.id)) items.push(item); });
-    scanComplete = data.scan_complete; scanned = data.scanned; total = data.total;
+    data.items.forEach(item => {
+      if (!knownItemIds.has(item.id)) { knownItemIds.add(item.id); items.push(item); }
+    });
+    scanComplete = data.scan_complete; scanned = data.scanned; total = data.total; dryRun = data.dry_run;
     if ($('workspace').hidden && position < items.length) render();
     else if (position >= items.length && scanComplete) finish();
     else if ($('workspace').hidden) waitForItem();
@@ -794,6 +823,7 @@ $('description').addEventListener('input', () => {
   $('proposed').textContent = proposedName(items[position], $('description').value);
 });
 $('save').addEventListener('click', renameCurrent);
+$('delete').addEventListener('click', deleteCurrent);
 $('skip').addEventListener('click', next);
 $('previous').addEventListener('click', () => { if (!busy && position > 0) { position--; render(); } });
 $('finish').addEventListener('click', finish);
@@ -1017,6 +1047,33 @@ def _browser_preview_path(server, item):
         return preview_path
 
 
+def _delete_review_item(server, item):
+    """Delete one reviewed video, or only remove it from a dry-run session."""
+    with server.preview_locks_lock:
+        item_lock = server.preview_locks.setdefault(item["id"], threading.Lock())
+
+    with item_lock, server.rename_lock, server.review_lock:
+        if item.get("deleted"):
+            raise ValueError("This video has already been deleted.")
+        source_path = item["path"]
+        if not server.dry_run:
+            try:
+                source_path.unlink()
+            except FileNotFoundError as exc:
+                raise ValueError(f"Video no longer exists: {source_path.name}") from exc
+        item["deleted"] = True
+
+        preview_path = item.pop("browser_preview_path", None)
+        if preview_path:
+            try:
+                preview_path.unlink()
+            except OSError:
+                pass
+            with server.preview_locks_lock:
+                server.generated_previews.discard(preview_path)
+        return source_path
+
+
 class _ThreadingHTTPServer(socketserver.ThreadingMixIn, HTTPServer):
     daemon_threads = True
     allow_reuse_address = True
@@ -1079,11 +1136,14 @@ class _ReviewRequestHandler(BaseHTTPRequestHandler):
             with self.server.review_lock:
                 response = {
                     "items": [
-                        _public_review_item(item) for item in self.server.review_items
+                        _public_review_item(item)
+                        for item in self.server.review_items
+                        if not item.get("deleted")
                     ],
                     "scanned": self.server.scan_progress,
                     "total": self.server.scan_total,
                     "scan_complete": self.server.scan_complete,
+                    "dry_run": self.server.dry_run,
                 }
             self._send_json(response)
             return
@@ -1155,7 +1215,7 @@ class _ReviewRequestHandler(BaseHTTPRequestHandler):
             self._send_json({"ok": True})
             threading.Timer(0.1, self.server.shutdown).start()
             return
-        if route not in ("/api/rename", "/api/open", "/api/geocode"):
+        if route not in ("/api/rename", "/api/open", "/api/geocode", "/api/delete"):
             self.send_error(404)
             return
         try:
@@ -1170,6 +1230,12 @@ class _ReviewRequestHandler(BaseHTTPRequestHandler):
                 return
             if route == "/api/geocode":
                 self._geocode(item)
+                return
+            if route == "/api/delete":
+                deleted_path = _delete_review_item(self.server, item)
+                prefix = "[DRY] DELETE" if self.server.dry_run else "[DELETE]"
+                print(f"{prefix} {deleted_path.name}")
+                self._send_json({"ok": True, "dry_run": self.server.dry_run})
                 return
             self._rename(item, request.get("description", ""))
         except (TypeError, ValueError, OSError) as exc:

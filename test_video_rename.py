@@ -8,10 +8,12 @@ from unittest.mock import patch
 
 import video_rename
 from video_rename import (
+    _INTERACTIVE_HTML,
     _audio_needs_browser_preview,
     _browser_preview_path,
     _build_descriptive_path,
     _build_new_path,
+    _delete_review_item,
     _description_parts,
     _get_video_date,
     _is_date_time_only_name,
@@ -485,6 +487,43 @@ class TestBrowserAudioPreview:
         command = run.call_args.args[0]
         assert command[command.index("-c:v") + 1] == "copy"
         assert command[command.index("-c:a") + 1] == "aac"
+
+
+class TestInteractiveDelete:
+    @staticmethod
+    def _server(dry_run):
+        return SimpleNamespace(
+            dry_run=dry_run,
+            preview_locks={},
+            preview_locks_lock=Lock(),
+            generated_previews=set(),
+            rename_lock=Lock(),
+            review_lock=Lock(),
+        )
+
+    def test_permanent_delete_removes_video(self, tmp_path):
+        video = tmp_path / "delete-me.mp4"
+        video.write_bytes(b"video")
+        item = {"id": 0, "path": video}
+
+        assert _delete_review_item(self._server(False), item) == video
+
+        assert not video.exists()
+        assert item["deleted"] is True
+
+    def test_dry_run_keeps_video(self, tmp_path):
+        video = tmp_path / "keep-me.mp4"
+        video.write_bytes(b"video")
+        item = {"id": 0, "path": video}
+
+        _delete_review_item(self._server(True), item)
+
+        assert video.exists()
+        assert item["deleted"] is True
+
+    def test_interface_requires_explicit_confirmation(self):
+        assert "window.confirm(prompt)" in _INTERACTIVE_HTML
+        assert "This cannot be undone." in _INTERACTIVE_HTML
 
 
 class TestGeocodingCourtesy:
