@@ -36,6 +36,8 @@ not used Git tags, entries are grouped by commit date rather than release tag.
   coordinates, serialize requests at one every 1.1 seconds, honor
   `Retry-After`, and use bounded backoff with a temporary cooldown for repeated
   rate limits.
+- Poll large interactive scans incrementally instead of retransmitting the
+  complete growing item list.
 - Allow the Nominatim domain to be changed with
   `VIDEO_RENAME_NOMINATIM_DOMAIN` and identify the application with a specific
   User-Agent.
@@ -48,6 +50,14 @@ not used Git tags, entries are grouped by commit date rather than release tag.
 - Restore sound in browser playback for videos whose audio codec is unsupported
   by converting only the temporary preview's audio stream.
 - Stop repeated 429 responses from producing request storms.
+- Reject invalid placeholder dates such as `0000-00-00` and continue searching
+  later metadata fields for a valid recording date.
+- Preserve international location suffixes produced by batch mode when deciding
+  whether a camera filename still needs a description.
+- Regenerate browser-compatible audio previews after their temporary files are
+  evicted.
+- Harden the local review server against DNS rebinding, cross-origin mutation
+  requests, and invalid negative request lengths.
 
 ## 2026-03-31
 

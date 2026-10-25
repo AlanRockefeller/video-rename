@@ -40,7 +40,10 @@ blocking the interface, and matching videos appear as soon as they are
 ready—even when the directory contains thousands of files. Files whose
 names clearly contain descriptions are skipped without running ExifTool or
 making any network request. Reverse geocoding is deferred until a video is
-actually shown in the review screen.
+actually shown in the review screen. The only exception is an ambiguous
+single-word suffix after a camera identifier, which is checked so an existing
+international location such as `IMG_1234_Mexico_horizontal` is not mistaken for
+a description.
 
 ```bash
 python3 video_rename.py /path/to/videos --interactive
@@ -76,7 +79,8 @@ MP4 preview by copying the video stream unchanged and converting only the audio
 to AAC. At most one converted preview is retained, and it is removed when the
 review session ends.
 
-The review server only listens on `127.0.0.1` and stops when you finish. You can
+The review server only listens on `127.0.0.1`, validates the local request host,
+requires JSON for every modifying request, and stops when you finish. You can
 combine `--interactive` with `--recursive` or `--dry-run`.
 
 Location lookup uses OpenStreetMap's Nominatim service conservatively: requests

@@ -17,9 +17,10 @@ import tempfile
 import threading
 import time
 import webbrowser
+from datetime import date
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 try:
     from geopy.exc import (
@@ -443,18 +444,30 @@ def _stem_has_orientation(stem):
     return _ORIENTATION_RE.search(stem) is not None
 
 
+def _valid_date_from_match(match):
+    """Return a normalized date for a regex match, or None if it is invalid."""
+    parts = tuple(int(part) for part in match.groups())
+    try:
+        date(*parts)
+    except ValueError:
+        return None
+    return "-".join(match.groups())
+
+
 def _get_video_date(exif_data, stem=""):
     """Return a YYYY-MM-DD recording date from EXIF or the filename."""
     for tag in VIDEO_DATE_TAGS:
         value = exif_data.get(tag)
         if value:
-            match = _DATE_RE.search(str(value))
-            if match:
-                return "-".join(match.groups())
+            for match in _DATE_RE.finditer(str(value)):
+                date_str = _valid_date_from_match(match)
+                if date_str:
+                    return date_str
 
-    match = _DATE_RE.search(stem)
-    if match:
-        return "-".join(match.groups())
+    for match in _DATE_RE.finditer(stem):
+        date_str = _valid_date_from_match(match)
+        if date_str:
+            return date_str
     return None
 
 
@@ -681,7 +694,7 @@ _INTERACTIVE_HTML = r"""<!doctype html>
 const $ = id => document.getElementById(id);
 let items = [], position = 0, busy = false, scanComplete = false, dryRun = false;
 const knownItemIds = new Set();
-let scanned = 0, total = 0, stopped = false, pollTimer = null;
+let scanned = 0, total = 0, itemOffset = 0, stopped = false, pollTimer = null;
 function cleanDescription(value) {
   return value.trim().replace(/[<>:"/\\|?*\x00-\x1f]/g, ' ')
     .replace(/[\s_]+/g, '_').replace(/^[ ._-]+|[ ._-]+$/g, '');
@@ -777,7 +790,7 @@ async function renameCurrent() {
 async function finish() {
   if (busy || stopped) return;
   stopped = true; clearTimeout(pollTimer); $('video').pause(); completeView();
-  try { await fetch('/api/finish', {method:'POST'}); } catch (_) {}
+  try { await fetch('/api/finish', {method:'POST', headers:{'Content-Type':'application/json'}, body:'{}'}); } catch (_) {}
 }
 async function deleteCurrent() {
   if (busy || position >= items.length) return;
@@ -804,11 +817,12 @@ async function deleteCurrent() {
 async function refreshItems() {
   if (stopped) return;
   try {
-    const response = await fetch('/api/items');
+    const response = await fetch(`/api/items?since=${itemOffset}`);
     const data = await response.json();
     data.items.forEach(item => {
       if (!knownItemIds.has(item.id)) { knownItemIds.add(item.id); items.push(item); }
     });
+    itemOffset = data.next_offset;
     scanComplete = data.scan_complete; scanned = data.scanned; total = data.total; dryRun = data.dry_run;
     if ($('workspace').hidden && position < items.length) render();
     else if (position >= items.length && scanComplete) finish();
@@ -868,6 +882,23 @@ def _public_review_item(item):
     }
 
 
+def _review_items_response(server, since):
+    """Return only review items added at or after a raw server-list offset."""
+    with server.review_lock:
+        return {
+            "items": [
+                _public_review_item(item)
+                for item in server.review_items[since:]
+                if not item.get("deleted")
+            ],
+            "next_offset": len(server.review_items),
+            "scanned": server.scan_progress,
+            "total": server.scan_total,
+            "scan_complete": server.scan_complete,
+            "dry_run": server.dry_run,
+        }
+
+
 def _orientation_from_stem(stem):
     """Return an orientation explicitly present in a filename, if any."""
     for orientation in ("horizontal", "vertical"):
@@ -884,6 +915,7 @@ def _prepare_review_item(
     resolve_location=True,
 ):
     """Read metadata and construct one item for the interactive reviewer."""
+    ambiguous_location_token = False
     if skip_metadata_if_described:
         quick_date = _get_video_date({}, file_path.stem)
         quick_orientation = _orientation_from_stem(file_path.stem)
@@ -891,22 +923,27 @@ def _prepare_review_item(
             file_path.stem, quick_date, None, quick_orientation
         )
         if quick_description:
-            if debug:
-                print(
-                    f"[DEBUG] file: {file_path.name}, existing description: "
-                    f"{quick_description} (metadata skipped)"
-                )
-            return {
-                "id": item_id,
-                "path": file_path,
-                "base_stem": quick_base,
-                "description": quick_description,
-                "date": quick_date,
-                "location": None,
-                "orientation": quick_orientation,
-                "latitude": None,
-                "longitude": None,
-            }
+            ambiguous_location_token = bool(
+                _CAMERA_ID_TOKEN_RE.fullmatch(quick_base)
+                and len(quick_description.split()) == 1
+            )
+            if not ambiguous_location_token:
+                if debug:
+                    print(
+                        f"[DEBUG] file: {file_path.name}, existing description: "
+                        f"{quick_description} (metadata skipped)"
+                    )
+                return {
+                    "id": item_id,
+                    "path": file_path,
+                    "base_stem": quick_base,
+                    "description": quick_description,
+                    "date": quick_date,
+                    "location": None,
+                    "orientation": quick_orientation,
+                    "latitude": None,
+                    "longitude": None,
+                }
 
     exif_data = get_exif_data(file_path)
     width = exif_data.get("ImageWidth")
@@ -916,7 +953,11 @@ def _prepare_review_item(
     date_str = _get_video_date(exif_data, file_path.stem)
     latitude = exif_data.get("GPSLatitude")
     longitude = exif_data.get("GPSLongitude")
-    location_str = get_location_info(latitude, longitude) if resolve_location else None
+    location_str = (
+        get_location_info(latitude, longitude)
+        if resolve_location or ambiguous_location_token
+        else None
+    )
     base_stem, description = _description_parts(
         file_path.stem, date_str, location_str, orientation
     )
@@ -995,12 +1036,12 @@ def _browser_preview_path(server, item):
         preview_path = item.get("browser_preview_path")
         if preview_path and preview_path.exists():
             return preview_path
-        if item.get("browser_preview_checked"):
-            return source_path
-        item["browser_preview_checked"] = True
-
-        if not _audio_needs_browser_preview(source_path):
-            return source_path
+        if not preview_path:
+            if item.get("browser_preview_checked"):
+                return source_path
+            item["browser_preview_checked"] = True
+            if not _audio_needs_browser_preview(source_path):
+                return source_path
 
         preview_path = server.preview_dir / f"video-{item['id']}.mp4"
         print(f"[PREVIEW] Converting audio for browser playback: {source_path.name}")
@@ -1087,6 +1128,18 @@ class _ReviewRequestHandler(BaseHTTPRequestHandler):
     def log_message(self, _format, *_args):
         return
 
+    def _allow_request(self, require_json=False):
+        """Reject non-local hosts and non-JSON mutation requests."""
+        port = self.server.server_address[1]
+        allowed_hosts = {f"127.0.0.1:{port}", f"localhost:{port}"}
+        if self.headers.get("Host", "").lower() not in allowed_hosts:
+            self.send_error(403, "Local requests only")
+            return False
+        if require_json and self.headers.get_content_type() != "application/json":
+            self.send_error(415, "JSON content type required")
+            return False
+        return True
+
     def _send_json(self, value, status=200):
         body = json.dumps(value).encode("utf-8")
         self.send_response(status)
@@ -1101,6 +1154,8 @@ class _ReviewRequestHandler(BaseHTTPRequestHandler):
             length = int(self.headers.get("Content-Length", "0"))
         except ValueError as exc:
             raise ValueError("Invalid request length.") from exc
+        if length < 0:
+            raise ValueError("Invalid request length.")
         if length > 65536:
             raise ValueError("Request is too large.")
         try:
@@ -1122,7 +1177,10 @@ class _ReviewRequestHandler(BaseHTTPRequestHandler):
             return None
 
     def do_GET(self):
-        route = urlparse(self.path).path
+        if not self._allow_request():
+            return
+        request_url = urlparse(self.path)
+        route = request_url.path
         if route == "/":
             body = _INTERACTIVE_HTML.encode("utf-8")
             self.send_response(200)
@@ -1133,19 +1191,14 @@ class _ReviewRequestHandler(BaseHTTPRequestHandler):
             self.wfile.write(body)
             return
         if route == "/api/items":
-            with self.server.review_lock:
-                response = {
-                    "items": [
-                        _public_review_item(item)
-                        for item in self.server.review_items
-                        if not item.get("deleted")
-                    ],
-                    "scanned": self.server.scan_progress,
-                    "total": self.server.scan_total,
-                    "scan_complete": self.server.scan_complete,
-                    "dry_run": self.server.dry_run,
-                }
-            self._send_json(response)
+            try:
+                since = int(parse_qs(request_url.query).get("since", ["0"])[0])
+                if since < 0:
+                    raise ValueError
+            except ValueError:
+                self.send_error(400, "Invalid item offset")
+                return
+            self._send_json(_review_items_response(self.server, since))
             return
         match = re.fullmatch(r"/video/(\d+)(/browser)?", route)
         if match:
@@ -1209,6 +1262,8 @@ class _ReviewRequestHandler(BaseHTTPRequestHandler):
             return
 
     def do_POST(self):
+        if not self._allow_request(require_json=True):
+            return
         route = urlparse(self.path).path
         if route == "/api/finish":
             self.server.stop_event.set()

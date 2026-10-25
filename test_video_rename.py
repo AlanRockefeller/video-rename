@@ -1,10 +1,12 @@
 """Tests for the pure helper functions in video_rename.py."""
 
 import json
+from email.message import Message
+from io import BytesIO
 from pathlib import Path
 from threading import Event, Lock
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import video_rename
 from video_rename import (
@@ -20,6 +22,8 @@ from video_rename import (
     _normalize_for_comparison,
     _parse_rotation,
     _prepare_review_item,
+    _review_items_response,
+    _ReviewRequestHandler,
     _sanitize_description,
     _scan_review_items,
     _stem_has_location,
@@ -352,6 +356,16 @@ class TestInteractiveDescriptionHelpers:
     def test_date_falls_back_to_filename(self):
         assert _get_video_date({}, "clip_2026-10-24") == "2026-10-24"
 
+    def test_invalid_exif_date_falls_through_to_valid_tag(self):
+        exif = {
+            "DateTimeOriginal": "0000:00:00 00:00:00",
+            "CreateDate": "2026:10:24 14:30:00",
+        }
+        assert _get_video_date(exif) == "2026-10-24"
+
+    def test_invalid_exif_and_filename_dates_are_ignored(self):
+        assert _get_video_date({"CreateDate": "2026:02:30"}, "clip_2026-13-01") is None
+
 
 class TestBackgroundReviewScan:
     @patch("video_rename._prepare_review_item")
@@ -448,6 +462,53 @@ class TestMetadataMinimization:
         assert item["longitude"] == -124.097
         assert item["location"] is None
 
+    @patch("video_rename.get_location_info", return_value="Mexico")
+    @patch(
+        "video_rename.get_exif_data",
+        return_value={
+            "ImageWidth": 1920,
+            "ImageHeight": 1080,
+            "GPSLatitude": 19.4,
+            "GPSLongitude": -99.1,
+        },
+    )
+    def test_single_country_token_after_camera_name_is_not_a_description(
+        self, _get_exif, get_location
+    ):
+        item = _prepare_review_item(
+            Path("IMG_1234_Mexico_horizontal.mp4"),
+            0,
+            skip_metadata_if_described=True,
+            resolve_location=False,
+        )
+
+        get_location.assert_called_once_with(19.4, -99.1)
+        assert item["base_stem"] == "IMG_1234"
+        assert item["description"] == ""
+        assert item["location"] == "Mexico"
+
+    @patch("video_rename.get_location_info", return_value="Mexico")
+    @patch(
+        "video_rename.get_exif_data",
+        return_value={
+            "ImageWidth": 1920,
+            "ImageHeight": 1080,
+            "GPSLatitude": 19.4,
+            "GPSLongitude": -99.1,
+        },
+    )
+    def test_genuine_single_word_description_is_preserved(
+        self, _get_exif, _get_location
+    ):
+        item = _prepare_review_item(
+            Path("IMG_1234_Beach_horizontal.mp4"),
+            0,
+            skip_metadata_if_described=True,
+            resolve_location=False,
+        )
+
+        assert item["description"] == "Beach"
+
 
 class TestBrowserAudioPreview:
     @patch("video_rename.FFPROBE_PATH", "/usr/bin/ffprobe")
@@ -488,6 +549,29 @@ class TestBrowserAudioPreview:
         assert command[command.index("-c:v") + 1] == "copy"
         assert command[command.index("-c:a") + 1] == "aac"
 
+    @patch("video_rename.FFMPEG_PATH", "/usr/bin/ffmpeg")
+    @patch("video_rename.FFPROBE_PATH", "/usr/bin/ffprobe")
+    @patch("video_rename._audio_needs_browser_preview")
+    @patch("video_rename.subprocess.run")
+    def test_evicted_audio_preview_is_regenerated(self, run, needs_preview, tmp_path):
+        server = SimpleNamespace(
+            preview_dir=tmp_path,
+            preview_locks={},
+            preview_locks_lock=Lock(),
+            generated_previews=set(),
+        )
+        item = {
+            "id": 4,
+            "path": Path("pcm-clip.MOV"),
+            "browser_preview_checked": True,
+            "browser_preview_path": tmp_path / "missing-preview.mp4",
+        }
+
+        assert _browser_preview_path(server, item) == tmp_path / "video-4.mp4"
+
+        needs_preview.assert_not_called()
+        run.assert_called_once()
+
 
 class TestInteractiveDelete:
     @staticmethod
@@ -524,6 +608,81 @@ class TestInteractiveDelete:
     def test_interface_requires_explicit_confirmation(self):
         assert "window.confirm(prompt)" in _INTERACTIVE_HTML
         assert "This cannot be undone." in _INTERACTIVE_HTML
+
+
+class TestInteractiveServerHardening:
+    @staticmethod
+    def _review_item(item_id, deleted=False):
+        return {
+            "id": item_id,
+            "path": Path(f"video-{item_id}.mp4"),
+            "base_stem": f"video-{item_id}",
+            "description": "",
+            "date": None,
+            "location": None,
+            "orientation": "horizontal",
+            "latitude": None,
+            "longitude": None,
+            "deleted": deleted,
+        }
+
+    def test_review_items_response_is_incremental(self):
+        server = SimpleNamespace(
+            review_lock=Lock(),
+            review_items=[
+                self._review_item(0),
+                self._review_item(1, deleted=True),
+                self._review_item(2),
+            ],
+            scan_progress=3,
+            scan_total=3,
+            scan_complete=True,
+            dry_run=False,
+        )
+
+        response = _review_items_response(server, 1)
+
+        assert [item["id"] for item in response["items"]] == [2]
+        assert response["next_offset"] == 3
+        assert "?since=${itemOffset}" in _INTERACTIVE_HTML
+
+    @staticmethod
+    def _request_handler(host, content_type=None):
+        handler = object.__new__(_ReviewRequestHandler)
+        handler.server = SimpleNamespace(server_address=("127.0.0.1", 4321))
+        handler.headers = Message()
+        handler.headers["Host"] = host
+        if content_type:
+            handler.headers["Content-Type"] = content_type
+        handler.send_error = MagicMock()
+        return handler
+
+    def test_accepts_local_json_request(self):
+        handler = self._request_handler("127.0.0.1:4321", "application/json")
+        assert handler._allow_request(require_json=True) is True
+        handler.send_error.assert_not_called()
+
+    def test_rejects_nonlocal_host(self):
+        handler = self._request_handler("attacker.example:4321", "application/json")
+        assert handler._allow_request(require_json=True) is False
+        handler.send_error.assert_called_once_with(403, "Local requests only")
+
+    def test_rejects_simple_cross_origin_content_type(self):
+        handler = self._request_handler("localhost:4321", "text/plain")
+        assert handler._allow_request(require_json=True) is False
+        handler.send_error.assert_called_once_with(415, "JSON content type required")
+
+    def test_rejects_negative_content_length(self):
+        handler = self._request_handler("localhost:4321", "application/json")
+        handler.headers["Content-Length"] = "-1"
+        handler.rfile = BytesIO(b"{}")
+
+        try:
+            handler._read_json()
+        except ValueError as error:
+            assert str(error) == "Invalid request length."
+        else:
+            raise AssertionError("Expected a negative Content-Length to be rejected")
 
 
 class TestGeocodingCourtesy:
