@@ -682,9 +682,20 @@ function cleanDescription(value) {
   return value.trim().replace(/[<>:"/\\|?*\x00-\x1f]/g, ' ')
     .replace(/[\s_]+/g, '_').replace(/^[ ._-]+|[ ._-]+$/g, '');
 }
+function containsDate(text, date) {
+  if (!date) return false;
+  const wanted = date.replace(/\D/g, '');
+  const datePattern = /(?:^|[^\d])(\d{8}|\d{4}[-_.:]\d{2}[-_.:]\d{2})(?!\d)/g;
+  let match;
+  while ((match = datePattern.exec(text)) !== null) {
+    if (match[1].replace(/\D/g, '') === wanted) return true;
+  }
+  return false;
+}
 function proposedName(item, description) {
   const clean = cleanDescription(description) || '[description]';
-  return [item.base_stem, clean, item.date, item.location, item.orientation]
+  const date = containsDate(`${item.base_stem}_${clean}`, item.date) ? null : item.date;
+  return [item.base_stem, clean, date, item.location, item.orientation]
     .filter(Boolean).join('_') + item.extension;
 }
 async function ensureLocation(item) {
