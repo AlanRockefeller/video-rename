@@ -1,6 +1,10 @@
 # yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
 # CodeRabbit pull request review configuration.
 reviews:
+  auto_review:
+    # Keep reviewing every push. The default pauses automatic reviews after
+    # five reviewed commits, which then requires a manual "@coderabbitai review".
+    auto_pause_after_reviewed_commits: 0
   pre_merge_checks:
     # The docstring-coverage check counts test methods, which conventionally
     # have no docstrings, so it flagged every pull request. Turn it off.
