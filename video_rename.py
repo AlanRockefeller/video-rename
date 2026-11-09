@@ -640,6 +640,14 @@ def _build_descriptive_path(
     return file_path.with_name("_".join(parts) + file_path.suffix)
 
 
+def _same_file(first, second):
+    """Return True when two paths refer to the same existing file."""
+    try:
+        return os.path.samefile(first, second)
+    except OSError:
+        return False
+
+
 def _build_new_path(file_path, location_str, orientation):
     """Build the new file path with location and orientation appended.
 
@@ -1487,10 +1495,14 @@ class _ReviewRequestHandler(BaseHTTPRequestHandler):
             item["orientation"],
             item["base_stem"],
         )
+        # Compare as text so a capitalization-only change still counts as a
+        # rename on Windows, and accept it on case-insensitive filesystems
+        # where the destination "exists" only because it is the same file.
+        changed = str(new_path) != str(old_path)
         with self.server.rename_lock, self.server.review_lock:
-            if new_path != old_path and new_path.exists():
+            if changed and new_path.exists() and not _same_file(old_path, new_path):
                 raise ValueError(f"A file named {new_path.name} already exists.")
-            if new_path != old_path and not self.server.dry_run:
+            if changed and not self.server.dry_run:
                 old_path.rename(new_path)
                 item["path"] = new_path
             item["description"] = description.strip()

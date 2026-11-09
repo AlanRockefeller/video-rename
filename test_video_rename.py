@@ -1,6 +1,7 @@
 """Tests for the pure helper functions in video_rename.py."""
 
 import json
+import os
 import subprocess
 import sys
 from email.message import Message
@@ -931,6 +932,57 @@ class TestMainArguments:
         assert "--include-described can only be used with --interactive" in (
             capsys.readouterr().err
         )
+
+
+class TestInteractiveRename:
+    @staticmethod
+    def _handler(dry_run=False):
+        handler = object.__new__(_ReviewRequestHandler)
+        handler.server = SimpleNamespace(
+            rename_lock=Lock(), review_lock=Lock(), dry_run=dry_run
+        )
+        handler._send_json = MagicMock()
+        return handler
+
+    @staticmethod
+    def _item(path):
+        return {
+            "id": 0,
+            "path": path,
+            "base_stem": "IMG_1234",
+            "description": "beach",
+            "date": None,
+            "location": None,
+            "orientation": "horizontal",
+            "latitude": None,
+            "longitude": None,
+        }
+
+    def test_rejects_collision_with_a_different_file(self, tmp_path):
+        old = tmp_path / "IMG_1234_beach_horizontal.mp4"
+        old.write_bytes(b"a")
+        (tmp_path / "IMG_1234_Beach_horizontal.mp4").write_bytes(b"b")
+
+        with pytest.raises(ValueError, match="already exists"):
+            self._handler()._rename(self._item(old), "Beach")
+
+        assert old.exists()
+
+    def test_capitalization_change_is_not_a_collision_with_itself(self, tmp_path):
+        old = tmp_path / "IMG_1234_beach_horizontal.mp4"
+        old.write_bytes(b"a")
+        new = tmp_path / "IMG_1234_Beach_horizontal.mp4"
+        # Mirror a case-insensitive filesystem: the destination exists and is
+        # the same file as the source.
+        os.link(old, new)
+        handler = self._handler()
+        item = self._item(old)
+
+        handler._rename(item, "Beach")
+
+        assert item["path"] == new
+        payload = handler._send_json.call_args.args[0]
+        assert payload["item"]["current_name"] == new.name
 
 
 class TestDeferredGeocodeEndpoint:

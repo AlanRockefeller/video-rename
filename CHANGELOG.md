@@ -41,6 +41,8 @@ not used Git tags, entries are grouped by commit date rather than release tag.
 - Answer with 404 when a video disappears before it is streamed, and send a
   zero content length for an empty file.
 - Ignore duplicate paths, such as a file given together with its directory.
+- Allow an interactive rename that only changes capitalization on
+  case-insensitive filesystems instead of reporting a name collision.
 
 ## 2026-10-24
 
