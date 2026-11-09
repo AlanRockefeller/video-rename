@@ -660,9 +660,7 @@ class TestBrowserAudioPreview:
     @patch("video_rename.FFPROBE_PATH", "/usr/bin/ffprobe")
     @patch("video_rename._audio_needs_browser_preview")
     @patch("video_rename.subprocess.Popen")
-    def test_evicted_audio_preview_is_regenerated(
-        self, popen, needs_preview, tmp_path
-    ):
+    def test_evicted_audio_preview_is_regenerated(self, popen, needs_preview, tmp_path):
         popen.return_value = self._ffmpeg_process()
         server = self._server(tmp_path)
         item = {
@@ -947,7 +945,9 @@ class TestGeocodingCourtesy:
         error = video_rename.GeocoderTimedOut("Timed out")
         location = self._result({"country": "Mexico", "country_code": "mx"})
         with patch.object(
-            video_rename.GEOCODER, "reverse", side_effect=[error, location, error, error]
+            video_rename.GEOCODER,
+            "reverse",
+            side_effect=[error, location, error, error],
         ) as reverse:
             assert get_location_info(46.7, -124.1) is None
             assert get_location_info(47.7, -123.1) == "Mexico"
