@@ -199,6 +199,26 @@ def _location_from_geocoder_result(location):
     return country.replace(" ", "") or None
 
 
+def _geocode_cache_key(latitude, longitude):
+    """Return the rounded coordinates and the cache key they share."""
+    coords = (
+        round(float(latitude), GEOCODE_COORD_PRECISION),
+        round(float(longitude), GEOCODE_COORD_PRECISION),
+    )
+    precision = GEOCODE_COORD_PRECISION
+    return coords, f"{coords[0]:.{precision}f},{coords[1]:.{precision}f}"
+
+
+def _is_location_cached(latitude, longitude):
+    """Return True when a lookup for these coordinates has a stored result."""
+    if latitude is None or longitude is None:
+        return False
+    _, cache_key = _geocode_cache_key(latitude, longitude)
+    with _GEOCODE_LOCK:
+        _load_geocode_cache()
+        return cache_key in GEOCODE_CACHE
+
+
 def get_location_info(latitude, longitude):
     """
     Converts latitude and longitude to a location string (Country or USA_State).
@@ -212,11 +232,7 @@ def get_location_info(latitude, longitude):
     global _GEOCODE_LAST_REQUEST  # pylint: disable=global-statement
     global _GEOCODE_CONSECUTIVE_SERVICE_ERRORS  # pylint: disable=global-statement
 
-    coords = (
-        round(float(latitude), GEOCODE_COORD_PRECISION),
-        round(float(longitude), GEOCODE_COORD_PRECISION),
-    )
-    cache_key = f"{coords[0]:.{GEOCODE_COORD_PRECISION}f},{coords[1]:.{GEOCODE_COORD_PRECISION}f}"
+    coords, cache_key = _geocode_cache_key(latitude, longitude)
 
     with _GEOCODE_LOCK:
         _load_geocode_cache()
@@ -764,12 +780,16 @@ async function ensureLocation(item) {
   if (!item.has_coordinates || item.locationResolved) return;
   if (!item.locationPromise) {
     const previousDescription = item.description || '';
+    item.locationAttempted = true;
     item.locationPromise = fetch('/api/geocode', {method:'POST', headers:{'Content-Type':'application/json'},
       body:JSON.stringify({id:item.id})})
       .then(async response => {
         const result = await response.json();
         if (!response.ok) throw new Error(result.error || 'Location lookup failed');
-        Object.assign(item, result.item); item.locationResolved = true;
+        Object.assign(item, result.item);
+        // A lookup the service could not complete is retried on a later visit
+        // or rename, once geocoding has recovered.
+        item.locationResolved = result.definitive !== false;
         if (position < items.length && items[position].id === item.id) {
           // The server drops a location token it has just recognized from the
           // existing description; mirror that unless the user already typed.
@@ -781,7 +801,8 @@ async function ensureLocation(item) {
           $('proposed').textContent = proposedName(item, input.value);
         }
       })
-      .catch(error => { item.locationResolved = true; $('message').textContent = error.message; });
+      .catch(error => { item.locationResolved = true; $('message').textContent = error.message; })
+      .finally(() => { if (!item.locationResolved) item.locationPromise = null; });
   }
   await item.locationPromise;
 }
@@ -901,8 +922,10 @@ async function refreshItems() {
 }
 $('description').addEventListener('input', () => {
   if (position >= items.length) return;
-  clearTimeout(locationTimer); ensureLocation(items[position]);
-  $('proposed').textContent = proposedName(items[position], $('description').value);
+  const item = items[position];
+  clearTimeout(locationTimer);
+  if (!item.locationAttempted) ensureLocation(item);
+  $('proposed').textContent = proposedName(item, $('description').value);
 });
 $('save').addEventListener('click', renameCurrent);
 $('delete').addEventListener('click', deleteCurrent);
@@ -1436,6 +1459,11 @@ class _ReviewRequestHandler(BaseHTTPRequestHandler):
     def _geocode(self, item):
         """Resolve location for a video only when it is actually reviewed."""
         location_str = get_location_info(item["latitude"], item["longitude"])
+        # A missing location is only final once the lookup has been cached;
+        # otherwise the service was unavailable and the browser may retry.
+        definitive = location_str is not None or _is_location_cached(
+            item["latitude"], item["longitude"]
+        )
         with self.server.review_lock:
             item["location"] = location_str
             item["base_stem"], item["description"] = _description_parts(
@@ -1445,7 +1473,7 @@ class _ReviewRequestHandler(BaseHTTPRequestHandler):
                 item["orientation"],
             )
             public_item = _public_review_item(item)
-        self._send_json({"ok": True, "item": public_item})
+        self._send_json({"ok": True, "item": public_item, "definitive": definitive})
 
     def _rename(self, item, description):
         if not isinstance(description, str):

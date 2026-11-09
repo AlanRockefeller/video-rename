@@ -933,6 +933,68 @@ class TestMainArguments:
         )
 
 
+class TestDeferredGeocodeEndpoint:
+    @staticmethod
+    def _handler():
+        handler = object.__new__(_ReviewRequestHandler)
+        handler.server = SimpleNamespace(review_lock=Lock())
+        handler._send_json = MagicMock()
+        return handler
+
+    @staticmethod
+    def _item():
+        return {
+            "id": 0,
+            "path": Path("IMG_1234_Mexico_horizontal.mp4"),
+            "base_stem": "IMG_1234",
+            "description": "Mexico",
+            "date": None,
+            "location": None,
+            "orientation": "horizontal",
+            "latitude": 19.4,
+            "longitude": -99.1,
+        }
+
+    @patch("video_rename._is_location_cached", return_value=False)
+    @patch("video_rename.get_location_info", return_value=None)
+    def test_unavailable_lookup_is_not_final(self, _lookup, _cached):
+        handler = self._handler()
+
+        handler._geocode(self._item())
+
+        payload = handler._send_json.call_args.args[0]
+        assert payload["definitive"] is False
+        assert payload["item"]["description"] == "Mexico"
+
+    @patch("video_rename._is_location_cached", return_value=True)
+    @patch("video_rename.get_location_info", return_value=None)
+    def test_cached_missing_location_is_final(self, _lookup, _cached):
+        handler = self._handler()
+
+        handler._geocode(self._item())
+
+        assert handler._send_json.call_args.args[0]["definitive"] is True
+
+    @patch("video_rename.get_location_info", return_value="Mexico")
+    def test_found_location_is_removed_from_description(self, _lookup):
+        handler = self._handler()
+
+        handler._geocode(self._item())
+
+        payload = handler._send_json.call_args.args[0]
+        assert payload["definitive"] is True
+        assert payload["item"]["location"] == "Mexico"
+        assert payload["item"]["description"] == ""
+
+    def test_browser_retries_an_unfinished_lookup(self):
+        assert "item.locationResolved = result.definitive !== false;" in (
+            _INTERACTIVE_HTML
+        )
+        assert "if (!item.locationResolved) item.locationPromise = null;" in (
+            _INTERACTIVE_HTML
+        )
+
+
 class TestGeocodingCourtesy:
     @staticmethod
     def _reset_geocoding(monkeypatch):
@@ -960,6 +1022,14 @@ class TestGeocodingCourtesy:
 
     def test_result_without_country_is_no_location(self):
         assert _location_from_geocoder_result(self._result({})) is None
+
+    def test_is_location_cached_uses_rounded_key(self, monkeypatch):
+        monkeypatch.setattr(video_rename, "GEOCODE_CACHE", {"46.786,-124.097": None})
+        monkeypatch.setattr(video_rename, "_GEOCODE_CACHE_LOADED", True)
+
+        assert video_rename._is_location_cached(46.7859, -124.0967) is True
+        assert video_rename._is_location_cached(47.0, -124.0) is False
+        assert video_rename._is_location_cached(None, -124.0) is False
 
     def test_repeated_service_errors_pause_lookups(self, monkeypatch):
         self._reset_geocoding(monkeypatch)

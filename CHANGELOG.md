@@ -9,7 +9,11 @@ not used Git tags, entries are grouped by commit date rather than release tag.
 
 - Look up a video's location only after it has stayed on the review screen
   briefly or a description is being typed, so skipping quickly through videos
-  no longer queues a serialized Nominatim request for each one.
+  no longer queues a serialized Nominatim request for each one. The scanner
+  still checks an ambiguous single-word suffix after a camera-style name
+  before the video is shown, as described in the README.
+- Retry a location lookup that the service could not complete when the video
+  is revisited or renamed, instead of treating the first failure as final.
 - Pause online geocoding for a minute after two consecutive network or service
   failures instead of waiting out the full request timeout for every file.
 - Stop FFmpeg preview conversions after five minutes and terminate any still
@@ -67,10 +71,11 @@ not used Git tags, entries are grouped by commit date rather than release tag.
   in the background.
 - Skip ExifTool and network lookup entirely for filenames that already contain
   a clear description.
-- Defer reverse geocoding until a video is actually displayed, coalesce nearby
-  coordinates, serialize requests at one every 1.1 seconds, honor
-  `Retry-After`, and use bounded backoff with a temporary cooldown for repeated
-  rate limits.
+- Defer reverse geocoding until a video is actually displayed (except for an
+  ambiguous single-word suffix after a camera name, which is checked while
+  scanning), coalesce nearby coordinates, serialize requests at one every 1.1
+  seconds, honor `Retry-After`, and use bounded backoff with a temporary
+  cooldown for repeated rate limits.
 - Poll large interactive scans incrementally instead of retransmitting the
   complete growing item list.
 - Allow the Nominatim domain to be changed with
