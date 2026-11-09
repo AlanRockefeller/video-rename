@@ -959,28 +959,34 @@ class TestInteractiveRename:
         }
 
     def test_rejects_collision_with_a_different_file(self, tmp_path):
-        old = tmp_path / "IMG_1234_beach_horizontal.mp4"
+        # The names differ by more than letter case so the files are distinct
+        # on case-insensitive filesystems too.
+        old = tmp_path / "IMG_1234_sunset_horizontal.mp4"
         old.write_bytes(b"a")
-        (tmp_path / "IMG_1234_Beach_horizontal.mp4").write_bytes(b"b")
+        other = tmp_path / "IMG_1234_Beach_horizontal.mp4"
+        other.write_bytes(b"b")
 
         with pytest.raises(ValueError, match="already exists"):
             self._handler()._rename(self._item(old), "Beach")
 
-        assert old.exists()
+        assert old.read_bytes() == b"a"
+        assert other.read_bytes() == b"b"
 
     def test_capitalization_change_is_not_a_collision_with_itself(self, tmp_path):
         old = tmp_path / "IMG_1234_beach_horizontal.mp4"
         old.write_bytes(b"a")
         new = tmp_path / "IMG_1234_Beach_horizontal.mp4"
-        # Mirror a case-insensitive filesystem: the destination exists and is
-        # the same file as the source.
-        os.link(old, new)
+        # On a case-insensitive filesystem the destination already is the
+        # source; elsewhere a hard link mirrors that situation.
+        if not new.exists():
+            os.link(old, new)
         handler = self._handler()
         item = self._item(old)
 
         handler._rename(item, "Beach")
 
         assert item["path"] == new
+        assert new.read_bytes() == b"a"
         payload = handler._send_json.call_args.args[0]
         assert payload["item"]["current_name"] == new.name
 
