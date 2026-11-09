@@ -1,12 +1,16 @@
 """Tests for the pure helper functions in video_rename.py."""
 
 import json
+import subprocess
+import sys
 from email.message import Message
 from io import BytesIO
 from pathlib import Path
 from threading import Event, Lock
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
+
+import pytest
 
 import video_rename
 from video_rename import (
@@ -19,7 +23,9 @@ from video_rename import (
     _description_parts,
     _get_video_date,
     _is_date_time_only_name,
+    _location_from_geocoder_result,
     _normalize_for_comparison,
+    _orientation_from_stem,
     _parse_rotation,
     _prepare_review_item,
     _review_items_response,
@@ -28,8 +34,10 @@ from video_rename import (
     _scan_review_items,
     _stem_has_location,
     _stem_has_orientation,
+    _stop_preview_conversions,
     get_location_info,
     get_orientation,
+    get_video_files,
     process_file,
     run_cli,
 )
@@ -186,6 +194,42 @@ class TestStemHasOrientation:
     def test_empty_stem(self):
         assert _stem_has_orientation("") is False
 
+    def test_adjacent_orientation_tokens_both_match(self):
+        assert _stem_has_orientation("vertical_horizontal") is True
+
+
+# --- _orientation_from_stem ---
+
+
+class TestOrientationFromStem:
+    def test_trailing_token_wins(self):
+        assert _orientation_from_stem("vertical_then_horizontal") == "horizontal"
+        assert (
+            _orientation_from_stem("IMG_1_sunset_horizontal_pan_USA_CA_vertical")
+            == "vertical"
+        )
+
+    def test_case_is_normalized(self):
+        assert _orientation_from_stem("clip_Vertical") == "vertical"
+
+    def test_no_orientation(self):
+        assert _orientation_from_stem("clip") is None
+        assert _orientation_from_stem("verticalgarden") is None
+
+
+# --- get_video_files ---
+
+
+class TestGetVideoFiles:
+    def test_duplicate_paths_are_listed_once(self, tmp_path):
+        video = tmp_path / "a.mp4"
+        video.write_bytes(b"")
+        (tmp_path / "b.mov").write_bytes(b"")
+
+        files = list(get_video_files([str(tmp_path), str(video), str(video)], False))
+
+        assert sorted(path.name for path in files) == ["a.mp4", "b.mov"]
+
 
 # --- _build_new_path ---
 
@@ -286,6 +330,24 @@ class TestInteractiveDescriptionHelpers:
             "USA_CA",
             "vertical",
         ) == ("IMG_1234", "bear eating fish")
+
+    def test_longest_camera_prefix_keeps_counter_with_camera_name(self):
+        assert _description_parts("video_001_bear_fishing") == (
+            "video_001",
+            "bear fishing",
+        )
+        assert _description_parts("IMG_1234_5678_bear") == ("IMG_1234_5678", "bear")
+
+    def test_date_and_camera_id_prefix_is_recognized(self):
+        assert _description_parts("20200503-DSC_8463_bear_fishing") == (
+            "20200503-DSC_8463",
+            "bear fishing",
+        )
+
+    def test_single_word_after_timestamp_is_split_from_it(self):
+        assert _description_parts(
+            "2026-10-24_12-30-22_Mexico_horizontal", "2026-10-24", None, "horizontal"
+        ) == ("2026-10-24_12-30-22", "Mexico")
 
     def test_finds_saved_description_when_geocoding_is_unavailable(self):
         assert _description_parts(
@@ -497,6 +559,33 @@ class TestMetadataMinimization:
             "GPSLongitude": -99.1,
         },
     )
+    def test_single_country_token_after_any_camera_style_name_is_checked(
+        self, _get_exif, get_location
+    ):
+        for name in (
+            "PXL_20261024_143000123_Mexico_horizontal.mp4",
+            "video_001_Mexico_horizontal.mp4",
+            "2026-10-24_12-30-22_Mexico_horizontal.mp4",
+        ):
+            get_location.reset_mock()
+            item = _prepare_review_item(
+                Path(name), 0, skip_metadata_if_described=True, resolve_location=False
+            )
+
+            get_location.assert_called_once_with(19.4, -99.1)
+            assert item["description"] == "", name
+            assert item["location"] == "Mexico"
+
+    @patch("video_rename.get_location_info", return_value="Mexico")
+    @patch(
+        "video_rename.get_exif_data",
+        return_value={
+            "ImageWidth": 1920,
+            "ImageHeight": 1080,
+            "GPSLatitude": 19.4,
+            "GPSLongitude": -99.1,
+        },
+    )
     def test_genuine_single_word_description_is_preserved(
         self, _get_exif, _get_location
     ):
@@ -527,39 +616,55 @@ class TestBrowserAudioPreview:
         )
         assert _audio_needs_browser_preview(Path("clip.mp4")) is False
 
-    @patch("video_rename.FFMPEG_PATH", "/usr/bin/ffmpeg")
-    @patch("video_rename.FFPROBE_PATH", "/usr/bin/ffprobe")
-    @patch("video_rename._audio_needs_browser_preview", return_value=True)
-    @patch("video_rename.subprocess.run")
-    def test_preview_copies_video_and_converts_audio(
-        self, run, _needs_preview, tmp_path
-    ):
-        server = SimpleNamespace(
+    @staticmethod
+    def _server(tmp_path):
+        return SimpleNamespace(
             preview_dir=tmp_path,
             preview_locks={},
             preview_locks_lock=Lock(),
+            preview_processes=set(),
             generated_previews=set(),
+            stop_event=Event(),
         )
+
+    @staticmethod
+    def _ffmpeg_process(returncode=0):
+        process = MagicMock()
+        process.communicate.return_value = ("", "")
+        process.returncode = returncode
+        return process
+
+    @patch("video_rename.FFMPEG_PATH", "/usr/bin/ffmpeg")
+    @patch("video_rename.FFPROBE_PATH", "/usr/bin/ffprobe")
+    @patch("video_rename._audio_needs_browser_preview", return_value=True)
+    @patch("video_rename.subprocess.Popen")
+    def test_preview_copies_video_and_converts_audio(
+        self, popen, _needs_preview, tmp_path
+    ):
+        popen.return_value = self._ffmpeg_process()
+        server = self._server(tmp_path)
         item = {"id": 3, "path": Path("clip.MOV")}
 
         preview_path = _browser_preview_path(server, item)
 
         assert preview_path == tmp_path / "video-3.mp4"
-        command = run.call_args.args[0]
+        command = popen.call_args.args[0]
         assert command[command.index("-c:v") + 1] == "copy"
         assert command[command.index("-c:a") + 1] == "aac"
+        popen.return_value.communicate.assert_called_once_with(
+            timeout=video_rename.FFMPEG_PREVIEW_TIMEOUT_SECONDS
+        )
+        assert server.preview_processes == set()
 
     @patch("video_rename.FFMPEG_PATH", "/usr/bin/ffmpeg")
     @patch("video_rename.FFPROBE_PATH", "/usr/bin/ffprobe")
     @patch("video_rename._audio_needs_browser_preview")
-    @patch("video_rename.subprocess.run")
-    def test_evicted_audio_preview_is_regenerated(self, run, needs_preview, tmp_path):
-        server = SimpleNamespace(
-            preview_dir=tmp_path,
-            preview_locks={},
-            preview_locks_lock=Lock(),
-            generated_previews=set(),
-        )
+    @patch("video_rename.subprocess.Popen")
+    def test_evicted_audio_preview_is_regenerated(
+        self, popen, needs_preview, tmp_path
+    ):
+        popen.return_value = self._ffmpeg_process()
+        server = self._server(tmp_path)
         item = {
             "id": 4,
             "path": Path("pcm-clip.MOV"),
@@ -570,7 +675,43 @@ class TestBrowserAudioPreview:
         assert _browser_preview_path(server, item) == tmp_path / "video-4.mp4"
 
         needs_preview.assert_not_called()
-        run.assert_called_once()
+        popen.assert_called_once()
+
+    @patch("video_rename.FFMPEG_PATH", "/usr/bin/ffmpeg")
+    @patch("video_rename.FFPROBE_PATH", "/usr/bin/ffprobe")
+    @patch("video_rename._audio_needs_browser_preview", return_value=True)
+    @patch("video_rename.subprocess.Popen")
+    def test_stalled_conversion_is_killed_and_original_is_served(
+        self, popen, _needs_preview, tmp_path, capsys
+    ):
+        process = self._ffmpeg_process()
+        process.communicate.side_effect = [
+            subprocess.TimeoutExpired("ffmpeg", 300),
+            ("", ""),
+        ]
+        popen.return_value = process
+        server = self._server(tmp_path)
+        partial_preview = tmp_path / "video-5.mp4"
+        partial_preview.write_bytes(b"partial")
+        item = {"id": 5, "path": Path("slow.MOV")}
+
+        assert _browser_preview_path(server, item) == Path("slow.MOV")
+
+        process.kill.assert_called_once()
+        assert server.preview_processes == set()
+        assert not partial_preview.exists()
+        assert "Could not create browser audio preview" in capsys.readouterr().out
+
+    def test_finishing_terminates_running_conversions(self, tmp_path):
+        process = MagicMock()
+        process.wait.side_effect = [subprocess.TimeoutExpired("ffmpeg", 5), None]
+        server = self._server(tmp_path)
+        server.preview_processes.add(process)
+
+        _stop_preview_conversions(server)
+
+        process.terminate.assert_called_once()
+        process.kill.assert_called_once()
 
 
 class TestInteractiveDelete:
@@ -685,6 +826,82 @@ class TestInteractiveServerHardening:
             raise AssertionError("Expected a negative Content-Length to be rejected")
 
 
+class TestVideoStreaming:
+    @staticmethod
+    def _handler(range_header=None):
+        handler = object.__new__(_ReviewRequestHandler)
+        handler.headers = Message()
+        if range_header:
+            handler.headers["Range"] = range_header
+        handler.wfile = BytesIO()
+        handler.send_response = MagicMock()
+        handler.send_header = MagicMock()
+        handler.end_headers = MagicMock()
+        handler.send_error = MagicMock()
+        return handler
+
+    def test_empty_file_has_zero_content_length(self, tmp_path):
+        video = tmp_path / "empty.mp4"
+        video.write_bytes(b"")
+        handler = self._handler()
+
+        handler._serve_video(video)
+
+        handler.send_response.assert_called_once_with(200)
+        handler.send_header.assert_any_call("Content-Length", "0")
+        assert handler.wfile.getvalue() == b""
+
+    def test_missing_file_is_reported_as_not_found(self, tmp_path):
+        handler = self._handler()
+
+        handler._serve_video(tmp_path / "gone.mp4")
+
+        handler.send_error.assert_called_once_with(404, "Video not found")
+        handler.send_response.assert_not_called()
+
+    def test_range_request_streams_requested_bytes(self, tmp_path):
+        video = tmp_path / "clip.mp4"
+        video.write_bytes(b"0123456789")
+        handler = self._handler("bytes=2-5")
+
+        handler._serve_video(video)
+
+        handler.send_response.assert_called_once_with(206)
+        handler.send_header.assert_any_call("Content-Range", "bytes 2-5/10")
+        assert handler.wfile.getvalue() == b"2345"
+
+
+class TestInteractiveBrowserLogic:
+    def test_skip_cannot_move_past_pending_items(self):
+        assert "if (busy || position >= items.length) return;\n  position++;" in (
+            _INTERACTIVE_HTML
+        )
+
+    def test_location_lookup_waits_for_a_settled_video(self):
+        assert "scheduleLocationLookup(item);" in _INTERACTIVE_HTML
+        assert "\n  ensureLocation(item);\n" not in _INTERACTIVE_HTML
+
+    def test_corrected_description_replaces_untouched_input(self):
+        assert "if (input.value === previousDescription)" in _INTERACTIVE_HTML
+        assert "await ensureLocation(item);" in _INTERACTIVE_HTML
+
+
+class TestMainArguments:
+    @patch("video_rename.get_video_files")
+    def test_include_described_requires_interactive_before_scanning(
+        self, get_files, capsys
+    ):
+        argv = ["video_rename.py", "/videos", "--include-described"]
+        with patch.object(sys, "argv", argv), pytest.raises(SystemExit) as exit_info:
+            video_rename.main()
+
+        assert exit_info.value.code == 2
+        get_files.assert_not_called()
+        assert "--include-described can only be used with --interactive" in (
+            capsys.readouterr().err
+        )
+
+
 class TestGeocodingCourtesy:
     @staticmethod
     def _reset_geocoding(monkeypatch):
@@ -692,8 +909,52 @@ class TestGeocodingCourtesy:
         monkeypatch.setattr(video_rename, "_GEOCODE_CACHE_LOADED", True)
         monkeypatch.setattr(video_rename, "_GEOCODE_COOLDOWN_UNTIL", 0.0)
         monkeypatch.setattr(video_rename, "_GEOCODE_LAST_REQUEST", 0.0)
+        monkeypatch.setattr(video_rename, "_GEOCODE_CONSECUTIVE_SERVICE_ERRORS", 0)
         monkeypatch.setattr(video_rename, "GEOCODE_MIN_INTERVAL_SECONDS", 0)
         monkeypatch.setattr(video_rename, "_save_geocode_cache", lambda: None)
+
+    @staticmethod
+    def _result(address):
+        return SimpleNamespace(raw={"address": address})
+
+    def test_us_result_without_state_uses_country_token(self):
+        result = self._result({"country": "United States", "country_code": "us"})
+        assert _location_from_geocoder_result(result) == "USA"
+
+    def test_unlisted_us_state_has_no_spaces(self):
+        result = self._result(
+            {"country": "United States", "country_code": "us", "state": "Baker Island"}
+        )
+        assert _location_from_geocoder_result(result) == "USA_BakerIsland"
+
+    def test_result_without_country_is_no_location(self):
+        assert _location_from_geocoder_result(self._result({})) is None
+
+    def test_repeated_service_errors_pause_lookups(self, monkeypatch):
+        self._reset_geocoding(monkeypatch)
+        error = video_rename.GeocoderUnavailable("Service not known")
+        with patch.object(
+            video_rename.GEOCODER, "reverse", side_effect=error
+        ) as reverse:
+            assert get_location_info(46.7, -124.1) is None
+            assert get_location_info(47.7, -123.1) is None
+            assert get_location_info(48.7, -122.1) is None
+
+        assert reverse.call_count == 2
+
+    def test_successful_lookup_resets_service_error_count(self, monkeypatch):
+        self._reset_geocoding(monkeypatch)
+        error = video_rename.GeocoderTimedOut("Timed out")
+        location = self._result({"country": "Mexico", "country_code": "mx"})
+        with patch.object(
+            video_rename.GEOCODER, "reverse", side_effect=[error, location, error, error]
+        ) as reverse:
+            assert get_location_info(46.7, -124.1) is None
+            assert get_location_info(47.7, -123.1) == "Mexico"
+            assert get_location_info(48.7, -122.1) is None
+            assert get_location_info(49.7, -121.1) is None
+
+        assert reverse.call_count == 4
 
     def test_nearby_coordinates_share_cached_request(self, monkeypatch):
         self._reset_geocoding(monkeypatch)

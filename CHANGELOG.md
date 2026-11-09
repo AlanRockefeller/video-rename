@@ -3,6 +3,41 @@
 Notable changes to Video Renamer are documented here. Because the project has
 not used Git tags, entries are grouped by commit date rather than release tag.
 
+## 2026-11-08
+
+### Changed
+
+- Look up a video's location only after it has stayed on the review screen
+  briefly or a description is being typed, so skipping quickly through videos
+  no longer queues a serialized Nominatim request for each one.
+- Pause online geocoding for a minute after two consecutive network or service
+  failures instead of waiting out the full request timeout for every file.
+- Stop FFmpeg preview conversions after five minutes and terminate any still
+  running when the review ends, so a stalled conversion cannot block deleting
+  the same video or leave the temporary preview directory behind.
+- Documented the actual minimum Python version (3.7) and the three-decimal
+  coordinate rounding used by the geocoding cache.
+
+### Fixed
+
+- Refresh the description field after a location lookup removes a recognized
+  location token, so `--include-described` no longer proposes names such as
+  `..._Mexico_Mexico_vertical.mp4`.
+- Treat a single word after any camera-style name (Pixel timestamps,
+  `video_001`, date-time names) as a possible batch-mode location, not only
+  after `IMG`/`DSC`-style identifiers, so those files are offered for review.
+- Keep the longest camera-style prefix when splitting a name, so `video_001`
+  is no longer split into `video` plus a description starting with `001`.
+- Use the trailing orientation token when a filename contains both
+  `vertical` and `horizontal`.
+- Fall back to a bare `USA` token when a US geocoding result has no state,
+  instead of producing `USA_`.
+- Reject `--include-described` without `--interactive` before scanning for
+  files, including when no videos are found.
+- Answer with 404 when a video disappears before it is streamed, and send a
+  zero content length for an empty file.
+- Ignore duplicate paths, such as a file given together with its directory.
+
 ## 2026-10-24
 
 ### Added

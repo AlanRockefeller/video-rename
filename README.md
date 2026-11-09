@@ -39,11 +39,12 @@ The review screen opens immediately. Metadata scanning continues without
 blocking the interface, and matching videos appear as soon as they are
 ready—even when the directory contains thousands of files. Files whose
 names clearly contain descriptions are skipped without running ExifTool or
-making any network request. Reverse geocoding is deferred until a video is
-actually shown in the review screen. The only exception is an ambiguous
-single-word suffix after a camera identifier, which is checked so an existing
-international location such as `IMG_1234_Mexico_horizontal` is not mistaken for
-a description.
+making any network request. Reverse geocoding is deferred until a video has
+stayed on the review screen briefly or you start typing its description, so
+skipping quickly past videos makes no requests. The only exception is an
+ambiguous single-word suffix after a camera-style name, which is checked so an
+existing international location such as `IMG_1234_Mexico_horizontal` or
+`PXL_20261024_143000123_Mexico_horizontal` is not mistaken for a description.
 
 ```bash
 python3 video_rename.py /path/to/videos --interactive
@@ -97,7 +98,7 @@ or your own instance. Location data is ©
 
 ## Requirements
 
-- Python 3.6+
+- Python 3.7+
 - `exiftool`: This must be installed and accessible in your system's PATH. You can find installation instructions at [exiftool.org](https://exiftool.org/install.html).
 - `ffmpeg` and `ffprobe`: Optional, but recommended for browser-compatible audio previews.
 - `geopy` Python library.

@@ -128,10 +128,15 @@ GEOCODE_MIN_INTERVAL_SECONDS = 1.1
 GEOCODE_MAX_RATE_LIMIT_RETRIES = 2
 GEOCODE_MAX_INLINE_BACKOFF_SECONDS = 30
 GEOCODE_RATE_LIMIT_COOLDOWN_SECONDS = 60
+# Repeated network or service failures (for example while offline) pause online
+# lookups so each remaining file does not wait out the full request timeout.
+GEOCODE_SERVICE_ERRORS_BEFORE_COOLDOWN = 2
+GEOCODE_SERVICE_ERROR_COOLDOWN_SECONDS = 60
 _GEOCODE_LOCK = threading.Lock()
 _GEOCODE_CACHE_LOADED = False
 _GEOCODE_LAST_REQUEST = 0.0
 _GEOCODE_COOLDOWN_UNTIL = 0.0
+_GEOCODE_CONSECUTIVE_SERVICE_ERRORS = 0
 _GEOCODE_CACHE_WARNING_SHOWN = False
 
 
@@ -187,9 +192,11 @@ def _location_from_geocoder_result(location):
     country_code = address.get("country_code", "").upper()
     if country_code == "US":
         state = address.get("state", "")
-        state_abbr = US_STATES.get(state, state)
-        return f"USA_{state_abbr}"
-    return country.replace(" ", "")
+        state_abbr = US_STATES.get(state, state).replace(" ", "")
+        # Results without a state (for example territorial waters) get a bare
+        # country token rather than the malformed "USA_".
+        return f"USA_{state_abbr}" if state_abbr else "USA"
+    return country.replace(" ", "") or None
 
 
 def get_location_info(latitude, longitude):
@@ -203,6 +210,7 @@ def get_location_info(latitude, longitude):
 
     global _GEOCODE_COOLDOWN_UNTIL  # pylint: disable=global-statement
     global _GEOCODE_LAST_REQUEST  # pylint: disable=global-statement
+    global _GEOCODE_CONSECUTIVE_SERVICE_ERRORS  # pylint: disable=global-statement
 
     coords = (
         round(float(latitude), GEOCODE_COORD_PRECISION),
@@ -246,7 +254,20 @@ def get_location_info(latitude, longitude):
                     "429" in str(exc) or "too many requests" in str(exc).lower()
                 )
                 if not is_rate_limit:
-                    print(f"Warning: Geocoding service error for {coords}: {exc}")
+                    _GEOCODE_CONSECUTIVE_SERVICE_ERRORS += 1
+                    message = f"Warning: Geocoding service error for {coords}: {exc}"
+                    if (
+                        _GEOCODE_CONSECUTIVE_SERVICE_ERRORS
+                        >= GEOCODE_SERVICE_ERRORS_BEFORE_COOLDOWN
+                    ):
+                        _GEOCODE_COOLDOWN_UNTIL = (
+                            time.monotonic() + GEOCODE_SERVICE_ERROR_COOLDOWN_SECONDS
+                        )
+                        message += (
+                            "; pausing online lookups for "
+                            f"{GEOCODE_SERVICE_ERROR_COOLDOWN_SECONDS} seconds."
+                        )
+                    print(message)
                     return None
                 delay = 5 * (3**attempt)
 
@@ -268,6 +289,7 @@ def get_location_info(latitude, longitude):
             )
             time.sleep(float(delay))
 
+        _GEOCODE_CONSECUTIVE_SERVICE_ERRORS = 0
         result = _location_from_geocoder_result(location)
         GEOCODE_CACHE[cache_key] = result
         _save_geocode_cache()
@@ -329,7 +351,21 @@ def _walk_error(err):
 
 
 def get_video_files(paths, recursive):
-    """Yields all video files from the given paths."""
+    """Yields all video files from the given paths, skipping duplicates.
+
+    The same file can be reached more than once when a path is repeated or
+    when both a file and the directory containing it are given.
+    """
+    seen = set()
+    for file_path in _iter_video_files(paths, recursive):
+        key = os.path.realpath(file_path)
+        if key not in seen:
+            seen.add(key)
+            yield file_path
+
+
+def _iter_video_files(paths, recursive):
+    """Yields every video file reachable from the given paths."""
     for path_str in paths:
         path = Path(path_str)
         if path.is_file():
@@ -393,8 +429,10 @@ def _stem_has_location(stem, location_str):
     return False
 
 
+# The orientation word is captured so callers can read which one is present,
+# and lookarounds leave the separators unconsumed so adjacent tokens all match.
 _ORIENTATION_RE = re.compile(
-    r"(?:^|[_\- ])(?:horizontal|vertical)(?:$|[_\- ])", re.IGNORECASE
+    r"(?:^|(?<=[_\- ]))(horizontal|vertical)(?=$|[_\- ])", re.IGNORECASE
 )
 
 _DATE_RE = re.compile(r"(?<!\d)(\d{4})[:_-](\d{2})[:_-](\d{2})(?!\d)")
@@ -489,6 +527,11 @@ def _is_date_time_only_name(stem):
     return re.sub(r"[\s_.(),-]+", "", remainder) == ""
 
 
+def _is_camera_style_name(stem):
+    """Return True for generated names (camera IDs, timestamps, UUIDs) without words."""
+    return bool(_CAMERA_NAME_RE.fullmatch(stem)) or _is_date_time_only_name(stem)
+
+
 def _remove_metadata_tokens(stem, date_str, location_str, orientation):
     """Remove metadata tokens so the descriptive part can be inspected."""
     result = stem
@@ -535,17 +578,19 @@ def _description_parts(stem, date_str=None, location_str=None, orientation=None)
     ).strip("_ -")
     if not content_stem:
         return "", ""
-    if _CAMERA_NAME_RE.fullmatch(content_stem) or _is_date_time_only_name(content_stem):
+    if _is_camera_style_name(content_stem):
         return content_stem, ""
 
-    # Recognize a description appended to a common camera basename.
+    # Recognize a description appended to a common camera basename.  The
+    # longest camera-style prefix wins so that trailing counters, such as the
+    # "001" in "video_001_bear_fishing", stay with the camera name.
+    base_stem, description = "", content_stem
     for separator_match in re.finditer(r"[_ -]+", content_stem):
         prefix = content_stem[: separator_match.start()]
-        if _CAMERA_NAME_RE.fullmatch(prefix):
-            description = content_stem[separator_match.end() :].strip("_ -")
-            return prefix, description.replace("_", " ")
-
-    return "", content_stem.replace("_", " ")
+        if _is_camera_style_name(prefix):
+            base_stem = prefix
+            description = content_stem[separator_match.end() :]
+    return base_stem, description.strip("_ -").replace("_", " ")
 
 
 def _build_descriptive_path(
@@ -694,7 +739,7 @@ _INTERACTIVE_HTML = r"""<!doctype html>
 const $ = id => document.getElementById(id);
 let items = [], position = 0, busy = false, scanComplete = false, dryRun = false;
 const knownItemIds = new Set();
-let scanned = 0, total = 0, itemOffset = 0, stopped = false, pollTimer = null;
+let scanned = 0, total = 0, itemOffset = 0, stopped = false, pollTimer = null, locationTimer = null;
 function cleanDescription(value) {
   return value.trim().replace(/[<>:"/\\|?*\x00-\x1f]/g, ' ')
     .replace(/[\s_]+/g, '_').replace(/^[ ._-]+|[ ._-]+$/g, '');
@@ -718,18 +763,35 @@ function proposedName(item, description) {
 async function ensureLocation(item) {
   if (!item.has_coordinates || item.locationResolved) return;
   if (!item.locationPromise) {
+    const previousDescription = item.description || '';
     item.locationPromise = fetch('/api/geocode', {method:'POST', headers:{'Content-Type':'application/json'},
       body:JSON.stringify({id:item.id})})
       .then(async response => {
         const result = await response.json();
         if (!response.ok) throw new Error(result.error || 'Location lookup failed');
         Object.assign(item, result.item); item.locationResolved = true;
-        if (position < items.length && items[position].id === item.id)
-          $('proposed').textContent = proposedName(item, $('description').value);
+        if (position < items.length && items[position].id === item.id) {
+          // The server drops a location token it has just recognized from the
+          // existing description; mirror that unless the user already typed.
+          const input = $('description');
+          if (input.value === previousDescription) {
+            input.value = item.description || '';
+            if (document.activeElement === input) input.select();
+          }
+          $('proposed').textContent = proposedName(item, input.value);
+        }
       })
       .catch(error => { item.locationResolved = true; $('message').textContent = error.message; });
   }
   await item.locationPromise;
+}
+// Look up the location only once a video has stayed on screen briefly (or the
+// user starts typing), so skipping quickly past items queues no lookups.
+function scheduleLocationLookup(item) {
+  clearTimeout(locationTimer);
+  locationTimer = setTimeout(() => {
+    if (position < items.length && items[position].id === item.id) ensureLocation(item);
+  }, 750);
 }
 function render() {
   if (position >= items.length) { waitForItem(); return; }
@@ -741,7 +803,7 @@ function render() {
   $('proposed').textContent = proposedName(item, $('description').value);
   $('previous').disabled = position === 0; $('message').textContent = '';
   const video = $('video'); video.pause(); video.src = `/video/${item.id}/browser`; video.load();
-  ensureLocation(item);
+  scheduleLocationLookup(item);
   $('description').focus(); $('description').select();
 }
 function updateProgress() {
@@ -762,7 +824,7 @@ function completeView() {
   $('progress').textContent = items.length ? `${items.length} reviewed` : `${scanned} scanned`;
 }
 function next() {
-  if (busy) return;
+  if (busy || position >= items.length) return;
   position++;
   if (position < items.length) render();
   else if (scanComplete) finish();
@@ -774,17 +836,21 @@ function setBusy(value) {
   $('previous').disabled = value || position === 0;
 }
 async function renameCurrent() {
-  if (busy) return;
-  const description = $('description').value;
-  if (!cleanDescription(description)) { $('message').textContent = 'Enter a description, or choose Skip.'; return; }
+  if (busy || position >= items.length) return;
+  const item = items[position];
+  const missing = 'Enter a description, or choose Skip.';
+  if (!cleanDescription($('description').value)) { $('message').textContent = missing; return; }
   setBusy(true); $('message').textContent = '';
   try {
-    await ensureLocation(items[position]);
+    clearTimeout(locationTimer); await ensureLocation(item);
+    // Read the description after the lookup, which may have corrected it.
+    const description = $('description').value;
+    if (!cleanDescription(description)) throw new Error(missing);
     const response = await fetch('/api/rename', {method:'POST', headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({id:items[position].id, description})});
+      body:JSON.stringify({id:item.id, description})});
     const result = await response.json();
     if (!response.ok) throw new Error(result.error || 'Rename failed');
-    Object.assign(items[position], result.item); setBusy(false); next();
+    Object.assign(item, result.item); setBusy(false); next();
   } catch (error) { $('message').textContent = error.message; setBusy(false); }
 }
 async function finish() {
@@ -834,6 +900,8 @@ async function refreshItems() {
   if (!stopped && !scanComplete) pollTimer = setTimeout(refreshItems, 400);
 }
 $('description').addEventListener('input', () => {
+  if (position >= items.length) return;
+  clearTimeout(locationTimer); ensureLocation(items[position]);
   $('proposed').textContent = proposedName(items[position], $('description').value);
 });
 $('save').addEventListener('click', renameCurrent);
@@ -900,11 +968,13 @@ def _review_items_response(server, since):
 
 
 def _orientation_from_stem(stem):
-    """Return an orientation explicitly present in a filename, if any."""
-    for orientation in ("horizontal", "vertical"):
-        if re.search(rf"(?:^|[_\- ]){orientation}(?:$|[_\- ])", stem, re.IGNORECASE):
-            return orientation
-    return None
+    """Return the last orientation token in a filename, if any.
+
+    Batch mode appends orientation, so the trailing token is the generated one
+    even when descriptive text earlier in the name uses the same word.
+    """
+    matches = _ORIENTATION_RE.findall(stem)
+    return matches[-1].lower() if matches else None
 
 
 def _prepare_review_item(
@@ -923,8 +993,11 @@ def _prepare_review_item(
             file_path.stem, quick_date, None, quick_orientation
         )
         if quick_description:
+            # A single word after any camera-style name may be a location that
+            # batch mode appended earlier, so metadata is read to find out.
             ambiguous_location_token = bool(
-                _CAMERA_ID_TOKEN_RE.fullmatch(quick_base)
+                quick_base
+                and _is_camera_style_name(quick_base)
                 and len(quick_description.split()) == 1
             )
             if not ambiguous_location_token:
@@ -981,6 +1054,7 @@ def _prepare_review_item(
 
 
 _BROWSER_AUDIO_CODECS = {"aac", "mp3", "opus", "vorbis"}
+FFMPEG_PREVIEW_TIMEOUT_SECONDS = 300
 
 
 def _audio_needs_browser_preview(file_path):
@@ -1045,35 +1119,40 @@ def _browser_preview_path(server, item):
 
         preview_path = server.preview_dir / f"video-{item['id']}.mp4"
         print(f"[PREVIEW] Converting audio for browser playback: {source_path.name}")
+        command = [
+            FFMPEG_PATH,
+            "-v",
+            "error",
+            "-y",
+            "-i",
+            str(source_path),
+            "-map",
+            "0:v:0?",
+            "-map",
+            "0:a:0?",
+            "-c:v",
+            "copy",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "192k",
+            "-movflags",
+            "+faststart",
+            str(preview_path),
+        ]
         try:
-            subprocess.run(
-                [
-                    FFMPEG_PATH,
-                    "-v",
-                    "error",
-                    "-y",
-                    "-i",
-                    str(source_path),
-                    "-map",
-                    "0:v:0?",
-                    "-map",
-                    "0:a:0?",
-                    "-c:v",
-                    "copy",
-                    "-c:a",
-                    "aac",
-                    "-b:a",
-                    "192k",
-                    "-movflags",
-                    "+faststart",
-                    str(preview_path),
-                ],
-                capture_output=True,
-                text=True,
-                check=True,
-            )
-        except (subprocess.CalledProcessError, OSError) as exc:
-            print(f"Warning: Could not create browser audio preview: {exc}")
+            _run_preview_conversion(server, command)
+        except (
+            subprocess.CalledProcessError,
+            subprocess.TimeoutExpired,
+            OSError,
+        ) as exc:
+            try:
+                preview_path.unlink()
+            except OSError:
+                pass
+            if not server.stop_event.is_set():
+                print(f"Warning: Could not create browser audio preview: {exc}")
             return source_path
 
         with server.preview_locks_lock:
@@ -1086,6 +1165,46 @@ def _browser_preview_path(server, item):
             server.generated_previews = {preview_path}
         item["browser_preview_path"] = preview_path
         return preview_path
+
+
+def _run_preview_conversion(server, command):
+    """Run an FFmpeg preview conversion that finishing the review can stop.
+
+    The process is tracked on the server so shutdown can terminate it, and the
+    timeout keeps a stalled conversion from holding the item lock (and with it
+    a later delete of the same video) indefinitely.
+    """
+    if server.stop_event.is_set():
+        raise OSError("The review session has ended.")
+    process = subprocess.Popen(  # pylint: disable=consider-using-with
+        command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True
+    )
+    with server.preview_locks_lock:
+        server.preview_processes.add(process)
+    try:
+        _, stderr = process.communicate(timeout=FFMPEG_PREVIEW_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.communicate()
+        raise
+    finally:
+        with server.preview_locks_lock:
+            server.preview_processes.discard(process)
+    if process.returncode != 0:
+        raise subprocess.CalledProcessError(process.returncode, command, stderr=stderr)
+
+
+def _stop_preview_conversions(server):
+    """Terminate FFmpeg conversions still running when the review ends."""
+    with server.preview_locks_lock:
+        processes = list(server.preview_processes)
+    for process in processes:
+        process.terminate()
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
 
 
 def _delete_review_item(server, item):
@@ -1218,38 +1337,47 @@ class _ReviewRequestHandler(BaseHTTPRequestHandler):
     def _serve_video(self, path):
         """Stream a video with byte-range support for browser seeking."""
         try:
-            size = path.stat().st_size
-            start, end, status = 0, max(0, size - 1), 200
-            range_header = self.headers.get("Range")
-            if range_header:
-                match = re.fullmatch(r"bytes=(\d*)-(\d*)", range_header.strip())
-                if not match:
-                    self.send_error(416)
-                    return
-                first, last = match.groups()
-                if first:
-                    start = int(first)
-                    end = min(int(last), size - 1) if last else size - 1
-                elif last:
-                    start = max(0, size - int(last))
-                if start >= size or start > end:
-                    self.send_response(416)
-                    self.send_header("Content-Range", f"bytes */{size}")
-                    self.end_headers()
-                    return
-                status = 206
+            try:
+                source = path.open("rb")
+            except OSError:
+                # The file may have been renamed, deleted, or its preview
+                # evicted since it was listed; answer the browser rather than
+                # dropping the connection without a response.
+                self.send_error(404, "Video not found")
+                return
+            with source:
+                size = os.fstat(source.fileno()).st_size
+                start, end, status = 0, size - 1, 200
+                range_header = self.headers.get("Range")
+                if range_header:
+                    match = re.fullmatch(r"bytes=(\d*)-(\d*)", range_header.strip())
+                    if not match:
+                        self.send_error(416)
+                        return
+                    first, last = match.groups()
+                    if first:
+                        start = int(first)
+                        end = min(int(last), size - 1) if last else size - 1
+                    elif last:
+                        start = max(0, size - int(last))
+                    if start >= size or start > end:
+                        self.send_response(416)
+                        self.send_header("Content-Range", f"bytes */{size}")
+                        self.end_headers()
+                        return
+                    status = 206
 
-            length = max(0, end - start + 1)
-            self.send_response(status)
-            self.send_header(
-                "Content-Type", mimetypes.guess_type(path.name)[0] or "video/mp4"
-            )
-            self.send_header("Accept-Ranges", "bytes")
-            self.send_header("Content-Length", str(length))
-            if status == 206:
-                self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
-            self.end_headers()
-            with path.open("rb") as source:
+                # An empty file has end == -1 and therefore a zero length.
+                length = max(0, end - start + 1)
+                self.send_response(status)
+                self.send_header(
+                    "Content-Type", mimetypes.guess_type(path.name)[0] or "video/mp4"
+                )
+                self.send_header("Accept-Ranges", "bytes")
+                self.send_header("Content-Length", str(length))
+                if status == 206:
+                    self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+                self.end_headers()
                 source.seek(start)
                 remaining = length
                 while remaining:
@@ -1395,6 +1523,7 @@ def run_interactive(video_files, include_described=False, dry_run=False, debug=F
     server.preview_dir = Path(preview_directory.name)
     server.preview_locks = {}
     server.preview_locks_lock = threading.Lock()
+    server.preview_processes = set()
     server.generated_previews = set()
     scanner = threading.Thread(
         target=_scan_review_items,
@@ -1413,7 +1542,11 @@ def run_interactive(video_files, include_described=False, dry_run=False, debug=F
     finally:
         server.stop_event.set()
         server.server_close()
-        preview_directory.cleanup()
+        _stop_preview_conversions(server)
+        try:
+            preview_directory.cleanup()
+        except OSError as exc:
+            print(f"Warning: Could not remove browser preview files: {exc}")
 
 
 # --- Main Logic ---
@@ -1546,6 +1679,9 @@ Examples:
 
     args = parser.parse_args()
 
+    if args.include_described and not args.interactive:
+        parser.error("--include-described can only be used with --interactive")
+
     if not EXIFTOOL_PATH:
         print("Error: 'exiftool' is not installed or not in your system's PATH.")
         print("Please install it to use this script.")
@@ -1562,9 +1698,6 @@ Examples:
     if not video_files:
         print("No video files found to process.")
         return
-
-    if args.include_described and not args.interactive:
-        parser.error("--include-described can only be used with --interactive")
 
     if args.interactive:
         run_interactive(
