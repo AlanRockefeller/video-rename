@@ -576,6 +576,39 @@ class TestMetadataMinimization:
             assert item["description"] == "", name
             assert item["location"] == "Mexico"
 
+    @patch("video_rename.get_location_info", return_value=None)
+    @patch(
+        "video_rename.get_exif_data",
+        return_value={
+            "ImageWidth": 1920,
+            "ImageHeight": 1080,
+            "GPSLatitude": 19.4,
+            "GPSLongitude": -99.1,
+        },
+    )
+    def test_unverified_single_token_stays_in_review(self, _get_exif, _get_location):
+        item = _prepare_review_item(
+            Path("IMG_1234_Mexico_horizontal.mp4"),
+            0,
+            skip_metadata_if_described=True,
+            resolve_location=False,
+        )
+
+        assert item["description"] == "Mexico"
+        assert item["needs_review"] is True
+
+        server = SimpleNamespace(
+            stop_event=Event(),
+            review_lock=Lock(),
+            review_items=[],
+            scan_progress=0,
+            scan_complete=False,
+        )
+        with patch("video_rename._prepare_review_item", return_value=item):
+            _scan_review_items(server, [item["path"]], False, False)
+
+        assert len(server.review_items) == 1
+
     @patch("video_rename.get_location_info", return_value="Mexico")
     @patch(
         "video_rename.get_exif_data",

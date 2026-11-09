@@ -1031,6 +1031,14 @@ def _prepare_review_item(
         if resolve_location or ambiguous_location_token
         else None
     )
+    # When the lookup is unavailable, a trailing token cannot be ruled out as a
+    # batch-mode location, so keep the item in the review instead of hiding it.
+    location_unverified = bool(
+        ambiguous_location_token
+        and location_str is None
+        and latitude is not None
+        and longitude is not None
+    )
     base_stem, description = _description_parts(
         file_path.stem, date_str, location_str, orientation
     )
@@ -1050,6 +1058,7 @@ def _prepare_review_item(
         "orientation": orientation,
         "latitude": latitude,
         "longitude": longitude,
+        "needs_review": location_unverified,
     }
 
 
@@ -1492,7 +1501,7 @@ def _scan_review_items(server, video_files, include_described, debug):
                 skip_metadata_if_described=not include_described,
                 resolve_location=False,
             )
-            if include_described or not item["description"]:
+            if include_described or not item["description"] or item.get("needs_review"):
                 with server.review_lock:
                     item["id"] = len(server.review_items)
                     server.review_items.append(item)
