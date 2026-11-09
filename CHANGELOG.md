@@ -1,7 +1,8 @@
 # Changelog
 
-Notable changes to Video Renamer are documented here. Because the project has
-not used Git tags, entries are grouped by commit date rather than release tag.
+Notable changes to Video Renamer are documented here. Entries are grouped by
+commit date rather than release tag; the `v1.2` tag covers the 2026-10-24 and
+2026-11-08 sections below.
 
 ## 2026-11-08
 
