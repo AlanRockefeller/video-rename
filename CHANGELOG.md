@@ -20,6 +20,11 @@ commit date rather than release tag; the `v1.2` tag covers the 2026-10-24 and
 - Added `--whisper-model` to choose the Whisper model (default `base`).
 - Transcripts are cached by file content and model, so renaming a video does
   not cause it to be transcribed again.
+- Added `--save-transcripts`, which also saves each transcript as a text file
+  next to its video (same name, `.txt`) so it can be found with desktop search
+  such as Spotlight. The text file is renamed along with its video and removed
+  if the video is deleted in the review screen. Text files the program did not
+  write are never overwritten, moved or deleted.
 
 ## 2026-11-08
 

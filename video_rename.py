@@ -976,6 +976,83 @@ class Transcriber:
             return text
 
 
+# --- Transcript files ---
+
+TRANSCRIPT_FILE_MARKER = "# Transcript written by video-rename"
+
+
+def transcript_file_path(video_path):
+    """Return the text file that holds a video's transcript, beside the video."""
+    video_path = Path(video_path)
+    return video_path.with_name(f"{video_path.stem}.txt")
+
+
+def _is_transcript_file(path):
+    """Return True if path is a transcript file this program wrote."""
+    try:
+        with Path(path).open(encoding="utf-8") as handle:
+            return handle.readline().rstrip("\r\n") == TRANSCRIPT_FILE_MARKER
+    except (OSError, UnicodeDecodeError):
+        return False
+
+
+def save_transcript_file(video_path, transcript, model_name=None):
+    """Save a transcript as a text file beside its video.
+
+    Silent videos get no file. A text file with the same name that this
+    program did not write is never overwritten. Returns the path written,
+    or None.
+    """
+    if not transcript:
+        return None
+    path = transcript_file_path(video_path)
+    if path.exists() and not _is_transcript_file(path):
+        print(f"Warning: Not saving transcript; {path.name} already exists.")
+        return None
+    lines = [TRANSCRIPT_FILE_MARKER]
+    if model_name:
+        lines.append(
+            f"Speech model: {Path(str(model_name)).name}. Covers up to the first "
+            f"{TRANSCRIPT_MAX_SECONDS // 60} minutes of the video."
+        )
+    content = "\n".join(lines) + f"\n\n{transcript}\n"
+    try:
+        if path.exists() and path.read_text(encoding="utf-8") == content:
+            return path
+        temporary_path = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+        temporary_path.write_text(content, encoding="utf-8")
+        temporary_path.replace(path)
+    except OSError as exc:
+        print(f"Warning: Could not save transcript {path.name}: {exc}")
+        return None
+    return path
+
+
+def _move_transcript_file(old_video_path, new_video_path):
+    """Keep a saved transcript file paired with its video after a rename."""
+    old_path = transcript_file_path(old_video_path)
+    new_path = transcript_file_path(new_video_path)
+    if str(old_path) == str(new_path) or not _is_transcript_file(old_path):
+        return
+    if new_path.exists() and not _same_file(old_path, new_path):
+        print(f"Warning: Transcript not renamed; {new_path.name} already exists.")
+        return
+    try:
+        old_path.rename(new_path)
+    except OSError as exc:
+        print(f"Warning: Could not rename transcript {old_path.name}: {exc}")
+
+
+def _remove_transcript_file(video_path):
+    """Remove a saved transcript file whose video was deleted."""
+    path = transcript_file_path(video_path)
+    if _is_transcript_file(path):
+        try:
+            path.unlink()
+        except OSError as exc:
+            print(f"Warning: Could not remove transcript {path.name}: {exc}")
+
+
 # --- Clip catalog ---
 
 CATALOG_FIELDS = (
@@ -1013,7 +1090,9 @@ def _duration_seconds(exif_data):
     return seconds if seconds >= 0 else None
 
 
-def build_catalog_row(file_path, base_dir=None, transcriber=None, debug=False):
+def build_catalog_row(
+    file_path, base_dir=None, transcriber=None, debug=False, save_transcripts=False
+):
     """Describe one video for the clip catalog."""
     exif_data = get_exif_data(file_path)
     width = exif_data.get("ImageWidth")
@@ -1056,13 +1135,20 @@ def build_catalog_row(file_path, base_dir=None, transcriber=None, debug=False):
         transcript = transcriber.transcript(file_path)
         row["transcript"] = transcript or ""
         row["suggested_description"] = suggest_description(transcript)
+        if save_transcripts:
+            save_transcript_file(file_path, transcript, transcriber.model_name)
     if debug:
         print(f"[DEBUG] catalog row: {row}")
     return row
 
 
 def write_catalog(
-    video_files, output_path, base_dir=None, transcriber=None, debug=False
+    video_files,
+    output_path,
+    base_dir=None,
+    transcriber=None,
+    debug=False,
+    save_transcripts=False,
 ):
     """Write a spreadsheet (CSV) describing every video, without renaming any.
 
@@ -1081,7 +1167,13 @@ def write_catalog(
         print(f"[{number}/{total}] {file_path.name}")
         try:
             rows.append(
-                build_catalog_row(file_path.resolve(), base_dir, transcriber, debug)
+                build_catalog_row(
+                    file_path.resolve(),
+                    base_dir,
+                    transcriber,
+                    debug,
+                    save_transcripts=save_transcripts,
+                )
             )
         except TranscriberUnavailable:
             raise
@@ -1737,6 +1829,7 @@ def _delete_review_item(server, item):
                 source_path.unlink()
             except FileNotFoundError as exc:
                 raise ValueError(f"Video no longer exists: {source_path.name}") from exc
+            _remove_transcript_file(source_path)
         item["deleted"] = True
 
         preview_path = item.pop("browser_preview_path", None)
@@ -1989,6 +2082,7 @@ class _ReviewRequestHandler(BaseHTTPRequestHandler):
             if changed and not self.server.dry_run:
                 old_path.rename(new_path)
                 item["path"] = new_path
+                _move_transcript_file(old_path, new_path)
             item["description"] = description.strip()
         prefix = "[DRY]" if self.server.dry_run else "[RENAME]"
         print(f"{prefix} {old_path.name} → {new_path.name}")
@@ -2076,6 +2170,17 @@ def _transcribe_review_items(server):
             }
         with server.review_lock:
             server.transcripts[item["id"]] = entry
+            # Read the path again here: the video may have been renamed
+            # while it was being transcribed.
+            if (
+                transcript
+                and getattr(server, "save_transcripts", False)
+                and not server.dry_run
+                and not item.get("deleted")
+            ):
+                save_transcript_file(
+                    item["path"], transcript, server.transcriber.model_name
+                )
 
 
 def _scan_review_items(server, video_files, include_described, debug):
@@ -2108,7 +2213,12 @@ def _scan_review_items(server, video_files, include_described, debug):
 
 
 def run_interactive(
-    video_files, include_described=False, dry_run=False, debug=False, transcriber=None
+    video_files,
+    include_described=False,
+    dry_run=False,
+    debug=False,
+    transcriber=None,
+    save_transcripts=False,
 ):
     """Open the reviewer immediately and prepare video metadata in the background."""
     preview_directory = tempfile.TemporaryDirectory(prefix="video-rename-preview-")
@@ -2130,6 +2240,7 @@ def run_interactive(
     server.transcripts = {}
     server.transcript_priority = None
     server.transcription_failed = False
+    server.save_transcripts = save_transcripts
     scanner = threading.Thread(
         target=_scan_review_items,
         args=(server, video_files, include_described, debug),
@@ -2213,6 +2324,7 @@ def process_file(file_path, dry_run, debug, is_recursive, base_dir):
     else:
         try:
             shutil.move(file_path, new_path)
+            _move_transcript_file(file_path, new_path)
             print(f"[RENAME] {display_name} → {new_path.name}")
         except OSError as e:
             print(f"Error: Failed to rename {file_path.name}. Reason: {e}")
@@ -2234,6 +2346,10 @@ def main():
         print("  video_rename.py /path/to/videos --recursive")
         print("  video_rename.py /path/to/videos --recursive --catalog clips.csv")
         print("  video_rename.py /path/to/videos --interactive --transcribe")
+        print(
+            "  video_rename.py /path/to/videos --interactive --transcribe "
+            "--save-transcripts"
+        )
         print("  video_rename.py my_video.mp4 --dry-run")
         print("  video_rename.py my_video.mp4 --debug")
         print("  video_rename.py vid1.mov vid2.mp4 /path/to/more_vids")
@@ -2252,6 +2368,9 @@ Examples:
 
   # Same, with descriptions suggested from what is said in each video
   video_rename.py /path/to/videos --interactive --transcribe
+
+  # Also keep each transcript in a searchable text file beside its video
+  video_rename.py /path/to/videos --interactive --transcribe --save-transcripts
 
   # List every video in a spreadsheet without renaming anything
   video_rename.py /path/to/videos --recursive --catalog clips.csv
@@ -2305,6 +2424,13 @@ Examples:
         "suggests a description; --catalog adds transcript columns.",
     )
     parser.add_argument(
+        "--save-transcripts",
+        action="store_true",
+        help="With --transcribe, also save each transcript as a text file next\n"
+        "to its video (same name, .txt), so it can be searched with tools\n"
+        "such as Spotlight. The text file is renamed along with the video.",
+    )
+    parser.add_argument(
         "--whisper-model",
         default=DEFAULT_WHISPER_MODEL,
         metavar="NAME",
@@ -2325,6 +2451,8 @@ Examples:
         parser.error("--catalog cannot be combined with --interactive")
     if args.transcribe and not (args.interactive or args.catalog):
         parser.error("--transcribe can only be used with --interactive or --catalog")
+    if args.save_transcripts and not args.transcribe:
+        parser.error("--save-transcripts can only be used with --transcribe")
 
     if not EXIFTOOL_PATH:
         print("Error: 'exiftool' is not installed or not in your system's PATH.")
@@ -2364,7 +2492,12 @@ Examples:
             catalog_base = Path(args.paths[0]).resolve()
         try:
             count = write_catalog(
-                sorted_files, args.catalog, catalog_base, transcriber, args.debug
+                sorted_files,
+                args.catalog,
+                catalog_base,
+                transcriber,
+                args.debug,
+                save_transcripts=args.save_transcripts,
             )
         except (TranscriberUnavailable, ValueError, OSError) as exc:
             print(f"Error: {exc}")
@@ -2379,6 +2512,7 @@ Examples:
             dry_run=args.dry_run,
             debug=args.debug,
             transcriber=transcriber,
+            save_transcripts=args.save_transcripts,
         )
         return
 

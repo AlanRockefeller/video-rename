@@ -1618,3 +1618,154 @@ class TestCatalogArguments:
         assert base_dir == tmp_path.resolve()
         assert transcriber is None
         assert "Wrote 2 video(s) to clips.csv" in capsys.readouterr().out
+
+
+# --- Transcript files ---
+
+
+class TestTranscriptFiles:
+    def test_saves_a_marked_text_file_beside_the_video(self, tmp_path):
+        video = tmp_path / "IMG_0001.mov"
+        video.write_bytes(b"v")
+
+        path = video_rename.save_transcript_file(
+            video, "Look at this Amanita muscaria", "/models/small.en"
+        )
+
+        assert path == tmp_path / "IMG_0001.txt"
+        text = path.read_text(encoding="utf-8")
+        assert text.startswith(video_rename.TRANSCRIPT_FILE_MARKER + "\n")
+        assert "Speech model: small.en." in text
+        assert "/models" not in text
+        assert text.endswith("\n\nLook at this Amanita muscaria\n")
+        assert not list(tmp_path.glob(".*.tmp"))
+
+    def test_silent_videos_get_no_file(self, tmp_path):
+        video = tmp_path / "IMG_0002.mov"
+
+        assert video_rename.save_transcript_file(video, "") is None
+        assert not (tmp_path / "IMG_0002.txt").exists()
+
+    def test_never_overwrites_someone_elses_text_file(self, tmp_path, capsys):
+        notes = tmp_path / "IMG_0003.txt"
+        notes.write_text("my field notes", encoding="utf-8")
+
+        result = video_rename.save_transcript_file(tmp_path / "IMG_0003.mov", "hi")
+
+        assert result is None
+        assert notes.read_text(encoding="utf-8") == "my field notes"
+        assert "already exists" in capsys.readouterr().out
+
+    def test_updates_its_own_file(self, tmp_path):
+        video = tmp_path / "IMG_0004.mov"
+        video_rename.save_transcript_file(video, "first")
+
+        video_rename.save_transcript_file(video, "second")
+
+        assert (
+            (tmp_path / "IMG_0004.txt")
+            .read_text(encoding="utf-8")
+            .endswith("\nsecond\n")
+        )
+
+    def test_rename_moves_only_its_own_transcript(self, tmp_path):
+        old = tmp_path / "IMG_0005.mov"
+        new = tmp_path / "IMG_0005_puffballs.mov"
+        video_rename.save_transcript_file(old, "puffballs everywhere")
+
+        video_rename._move_transcript_file(old, new)
+
+        assert not (tmp_path / "IMG_0005.txt").exists()
+        assert (tmp_path / "IMG_0005_puffballs.txt").exists()
+
+        other_old = tmp_path / "IMG_0006.mov"
+        (tmp_path / "IMG_0006.txt").write_text("not ours", encoding="utf-8")
+        video_rename._move_transcript_file(other_old, tmp_path / "IMG_0006_x.mov")
+        assert (tmp_path / "IMG_0006.txt").exists()
+        assert not (tmp_path / "IMG_0006_x.txt").exists()
+
+    def test_interactive_rename_carries_the_transcript(self, tmp_path):
+        old = tmp_path / "IMG_1234_horizontal.mp4"
+        old.write_bytes(b"a")
+        video_rename.save_transcript_file(old, "a lovely beach")
+        handler = TestInteractiveRename._handler()
+        item = TestInteractiveRename._item(old)
+
+        handler._rename(item, "Beach")
+
+        assert transcript_text(item["path"]).endswith("\na lovely beach\n")
+        assert not (tmp_path / "IMG_1234_horizontal.txt").exists()
+
+    def test_deleting_a_video_removes_its_transcript(self, tmp_path):
+        video = tmp_path / "delete-me.mp4"
+        video.write_bytes(b"v")
+        video_rename.save_transcript_file(video, "blurry")
+
+        _delete_review_item(
+            TestInteractiveDelete._server(False), {"id": 0, "path": video}
+        )
+
+        assert not (tmp_path / "delete-me.txt").exists()
+
+    def test_review_saves_transcripts_under_the_current_name(self, tmp_path):
+        old = tmp_path / "IMG_7.mp4"
+        renamed = tmp_path / "IMG_7_moths.mp4"
+        server = TestInteractiveTranscripts._server(items=1)
+        server.review_items[0]["path"] = old
+        server.dry_run = False
+        server.save_transcripts = True
+
+        def transcribe(_path):
+            # The reviewer renames the video while it is being transcribed.
+            server.review_items[0]["path"] = renamed
+            return "so many moths"
+
+        server.transcriber = MagicMock(model_name="small.en")
+        server.transcriber.transcript.side_effect = transcribe
+
+        video_rename._transcribe_review_items(server)
+
+        assert transcript_text(renamed).endswith("\nso many moths\n")
+        assert not (tmp_path / "IMG_7.txt").exists()
+
+    def test_review_dry_run_writes_nothing(self, tmp_path):
+        server = TestInteractiveTranscripts._server(items=1)
+        server.review_items[0]["path"] = tmp_path / "IMG_8.mp4"
+        server.dry_run = True
+        server.save_transcripts = True
+        server.transcriber = MagicMock(model_name="base")
+        server.transcriber.transcript.return_value = "hello"
+
+        video_rename._transcribe_review_items(server)
+
+        assert not list(tmp_path.iterdir())
+
+    @patch("video_rename.get_location_info", return_value=None)
+    @patch("video_rename.get_exif_data", return_value={})
+    def test_catalog_can_save_transcripts(self, _exif, _location, tmp_path):
+        video = tmp_path / "IMG_0009.mp4"
+        video.write_bytes(b"a")
+        transcriber = MagicMock(model_name="base")
+        transcriber.transcript.return_value = "Russula emetica"
+
+        video_rename.write_catalog(
+            [video],
+            tmp_path / "clips.csv",
+            transcriber=transcriber,
+            save_transcripts=True,
+        )
+
+        assert transcript_text(video).endswith("\nRussula emetica\n")
+
+    @patch("video_rename.get_video_files")
+    def test_save_transcripts_requires_transcribe(self, get_files, capsys):
+        argv = ["video_rename.py", "/videos", "--interactive", "--save-transcripts"]
+        with patch.object(sys, "argv", argv), pytest.raises(SystemExit):
+            video_rename.main()
+
+        get_files.assert_not_called()
+        assert "--save-transcripts can only be used" in capsys.readouterr().err
+
+
+def transcript_text(video):
+    return video_rename.transcript_file_path(video).read_text(encoding="utf-8")

@@ -106,6 +106,14 @@ Transcripts are cached in `transcripts.json` next to the geocoding cache. They
 are keyed by file content and model, so renamed videos are not transcribed
 again.
 
+Add `--save-transcripts` to also keep each transcript in a text file beside
+its video, with the same name and a `.txt` extension (for example
+`IMG_6426_amanita_2023-12-09_vertical.txt`). These files can be searched with
+Spotlight or any desktop search, and they stay paired with their video: when a
+video is renamed, its transcript file is renamed too, and deleting a video in
+the review screen deletes its transcript file. Silent videos get no file, and a
+text file the program did not write is never overwritten, moved or deleted.
+
 Location lookup uses OpenStreetMap's Nominatim service conservatively: requests
 are serialized and limited to at most one every 1.1 seconds, nearby coordinates
 share a cache entry, and successful/no-result lookups are persisted at
@@ -177,6 +185,7 @@ python3 video_rename.py [PATHS...] [OPTIONS]
 -   `--include-described`: Also show videos that already appear to have a description (interactive mode only).
 -   `--catalog CSV_FILE`: Write a spreadsheet listing every video instead of renaming. Cannot be combined with `--interactive`.
 -   `--transcribe`: Transcribe speech locally to suggest descriptions (`--interactive`) or add transcript columns (`--catalog`).
+-   `--save-transcripts`: With `--transcribe`, also save each transcript as a searchable `.txt` file beside its video.
 -   `--whisper-model NAME`: Whisper model for `--transcribe` (default `base`; `small` is more accurate but slower).
 -   `--debug`: Enable debug printing, which shows detailed metadata (width, height, rotation) for each file processed.
 
