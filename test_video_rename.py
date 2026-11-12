@@ -1244,3 +1244,377 @@ class TestRunCli:
         captured = capsys.readouterr()
         assert captured.out == ""
         assert captured.err == "\nCancelled.\n"
+
+
+# --- Transcript-based description suggestions ---
+
+
+class TestSuggestDescription:
+    def test_species_name_comes_first(self):
+        transcript = (
+            "Here we have a lobster mushroom. This lobster mushroom is "
+            "parasitized by Hypomyces lactifluorum, turning it bright orange."
+        )
+
+        suggestion = video_rename.suggest_description(transcript)
+
+        assert suggestion.startswith("Hypomyces lactifluorum")
+        assert "lobster" in suggestion and "mushroom" in suggestion
+
+    def test_keywords_keep_spoken_order(self):
+        transcript = "Bioluminescent fungi glowing tonight. Fungi everywhere, glowing."
+
+        assert video_rename.suggest_description(transcript) == (
+            "bioluminescent fungi glowing tonight everywhere"
+        )
+
+    def test_common_words_are_not_species_names(self):
+        suggestion = video_rename.suggest_description("This area has many puffballs")
+
+        assert not suggestion.startswith("This")
+        assert "puffballs" in suggestion
+
+    def test_respects_word_limit(self):
+        transcript = "one two three alpha bravo charlie delta echo foxtrot golf"
+
+        assert len(video_rename.suggest_description(transcript, 3).split()) == 3
+
+    def test_nothing_said_gives_no_suggestion(self):
+        assert video_rename.suggest_description("") == ""
+        assert video_rename.suggest_description(None) == ""
+        assert video_rename.suggest_description("oh wow yeah okay") == ""
+
+
+class TestTranscriber:
+    @pytest.fixture(autouse=True)
+    def _isolated_cache(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+
+    @staticmethod
+    def _video(tmp_path, name="IMG_0001.mp4", content=b"video bytes"):
+        path = tmp_path / name
+        path.write_bytes(content)
+        return path
+
+    def test_cached_transcript_survives_rename(self, tmp_path):
+        backend = MagicMock(return_value="  Amanita   muscaria under pines ")
+        transcriber = video_rename.Transcriber("base", backend=backend)
+        video = self._video(tmp_path)
+
+        with patch.object(
+            video_rename.Transcriber, "_extract_audio", return_value=True
+        ):
+            first = transcriber.transcript(video)
+            renamed = video.rename(tmp_path / "IMG_0001_amanita_horizontal.mp4")
+            # A new process reads the cache from disk.
+            second = video_rename.Transcriber("base", backend=backend).transcript(
+                renamed
+            )
+
+        assert first == second == "Amanita muscaria under pines"
+        backend.assert_called_once()
+
+    def test_cache_is_specific_to_the_model(self, tmp_path):
+        backend = MagicMock(return_value="text")
+        video = self._video(tmp_path)
+
+        with patch.object(
+            video_rename.Transcriber, "_extract_audio", return_value=True
+        ):
+            video_rename.Transcriber("base", backend=backend).transcript(video)
+            video_rename.Transcriber("small", backend=backend).transcript(video)
+
+        assert backend.call_count == 2
+
+    def test_video_without_audio_has_empty_transcript(self, tmp_path):
+        backend = MagicMock()
+        transcriber = video_rename.Transcriber("base", backend=backend)
+
+        with patch.object(
+            video_rename.Transcriber, "_extract_audio", return_value=False
+        ):
+            assert transcriber.transcript(self._video(tmp_path)) == ""
+
+        backend.assert_not_called()
+
+    def test_failed_transcription_is_not_cached(self, tmp_path, capsys):
+        backend = MagicMock(side_effect=[ValueError("decoder error"), "second try"])
+        transcriber = video_rename.Transcriber("base", backend=backend)
+        video = self._video(tmp_path)
+
+        with patch.object(
+            video_rename.Transcriber, "_extract_audio", return_value=True
+        ):
+            assert transcriber.transcript(video) is None
+            assert transcriber.transcript(video) == "second try"
+
+        assert "Could not transcribe" in capsys.readouterr().out
+
+    @patch("video_rename._load_speech_backend", return_value=None)
+    def test_missing_speech_recognizer_is_reported(self, _load, tmp_path):
+        transcriber = video_rename.Transcriber("base")
+
+        with pytest.raises(video_rename.TranscriberUnavailable, match="faster-whisper"):
+            transcriber.transcript(self._video(tmp_path))
+
+    @patch("video_rename._load_speech_backend", side_effect=OSError("offline"))
+    def test_model_that_cannot_load_is_reported_clearly(self, _load, tmp_path):
+        transcriber = video_rename.Transcriber("small")
+
+        with pytest.raises(
+            video_rename.TranscriberUnavailable, match="'small' speech model"
+        ):
+            transcriber.transcript(self._video(tmp_path))
+
+    @pytest.mark.skipif(not video_rename.FFMPEG_PATH, reason="FFmpeg not installed")
+    def test_extracts_audio_and_detects_silent_videos(self, tmp_path):
+        with_audio = tmp_path / "with_audio.mp4"
+        without_audio = tmp_path / "without_audio.mp4"
+        base = [video_rename.FFMPEG_PATH, "-v", "error", "-y", "-f", "lavfi"]
+        subprocess.run(
+            base
+            + ["-i", "color=c=black:s=64x64:d=1", "-f", "lavfi"]
+            + ["-i", "sine=frequency=440:duration=1", "-shortest", str(with_audio)],
+            check=True,
+        )
+        subprocess.run(
+            base + ["-i", "color=c=black:s=64x64:d=1", str(without_audio)],
+            check=True,
+        )
+
+        audio = tmp_path / "audio.wav"
+        assert video_rename.Transcriber._extract_audio(with_audio, audio) is True
+        assert audio.stat().st_size > 44
+
+        silent = tmp_path / "silent.wav"
+        assert video_rename.Transcriber._extract_audio(without_audio, silent) is False
+
+
+# --- Clip catalog ---
+
+
+class TestClipCatalog:
+    @staticmethod
+    def _exif():
+        return {
+            "ImageWidth": 1080,
+            "ImageHeight": 1920,
+            "Duration": 125.4,
+            "CreateDate": "2026:10:24 14:30:00",
+            "GPSLatitude": -0.2,
+            "GPSLongitude": -78.5,
+        }
+
+    @patch("video_rename.get_location_info", return_value="Ecuador")
+    @patch("video_rename.get_exif_data")
+    def test_row_describes_the_video(self, exif, _location, tmp_path):
+        exif.return_value = self._exif()
+        video = tmp_path / "trip" / "IMG_1234_cordyceps_on_ant_horizontal.mp4"
+        video.parent.mkdir()
+        video.write_bytes(b"x" * 2048)
+
+        row = video_rename.build_catalog_row(video, base_dir=tmp_path)
+
+        assert row["path"] == str(Path("trip") / video.name)
+        assert row["description"] == "cordyceps on ant horizontal"
+        assert row["date"] == "2026-10-24"
+        assert row["location"] == "Ecuador"
+        assert row["orientation"] == "vertical"
+        assert row["duration"] == "2:05"
+        assert row["duration_seconds"] == 125.4
+        assert row["width"] == 1080 and row["height"] == 1920
+        assert "transcript" not in row
+
+    @patch("video_rename.get_location_info", return_value=None)
+    @patch("video_rename.get_exif_data", return_value={})
+    def test_missing_metadata_leaves_cells_blank(self, _exif, _location, tmp_path):
+        video = tmp_path / "IMG_0002.mov"
+        video.write_bytes(b"")
+
+        row = video_rename.build_catalog_row(video)
+
+        assert row["description"] == ""
+        assert row["date"] == row["location"] == row["duration"] == ""
+        assert row["orientation"] == "horizontal"
+
+    def test_long_durations_include_hours(self):
+        assert video_rename._format_duration(3725) == "1:02:05"
+        assert video_rename._format_duration(59.6) == "1:00"
+
+    @patch("video_rename.get_location_info", return_value=None)
+    @patch("video_rename.get_exif_data")
+    def test_writes_csv_and_continues_past_bad_files(
+        self, exif, _location, tmp_path, capsys
+    ):
+        good = tmp_path / "IMG_0001_puffballs.mp4"
+        bad = tmp_path / "IMG_0002.mp4"
+        good.write_bytes(b"a")
+        bad.write_bytes(b"b")
+        exif.side_effect = [self._exif(), ValueError("unreadable")]
+        output = tmp_path / "clips.csv"
+
+        count = video_rename.write_catalog([good, bad], output, base_dir=tmp_path)
+
+        assert count == 1
+        raw = output.read_bytes()
+        assert raw.startswith(b"\xef\xbb\xbf")  # Excel-friendly UTF-8
+        rows = list(video_rename.csv.DictReader(raw.decode("utf-8-sig").splitlines()))
+        assert [row["filename"] for row in rows] == [good.name]
+        assert rows[0]["description"] == "puffballs"
+        assert "Could not catalog IMG_0002.mp4" in capsys.readouterr().out
+        assert not list(tmp_path.glob(".clips.csv.*.tmp"))
+
+    @patch("video_rename.get_location_info", return_value=None)
+    @patch("video_rename.get_exif_data", return_value={})
+    def test_transcript_columns_are_added_when_transcribing(
+        self, _exif, _location, tmp_path
+    ):
+        video = tmp_path / "IMG_0003.mp4"
+        video.write_bytes(b"a")
+        transcriber = MagicMock()
+        transcriber.transcript.return_value = "Look at this Amanita muscaria"
+        output = tmp_path / "clips.csv"
+
+        video_rename.write_catalog([video], output, transcriber=transcriber)
+
+        rows = list(video_rename.csv.DictReader(output.open(encoding="utf-8-sig")))
+        assert rows[0]["transcript"] == "Look at this Amanita muscaria"
+        assert rows[0]["suggested_description"] == "Amanita muscaria"
+
+    def test_refuses_to_overwrite_a_video(self, tmp_path):
+        with pytest.raises(ValueError, match="over a video"):
+            video_rename.write_catalog([], tmp_path / "clips.mp4")
+
+
+# --- Interactive transcripts ---
+
+
+class TestInteractiveTranscripts:
+    @staticmethod
+    def _server(transcriber=None, items=2, scan_complete=True):
+        return SimpleNamespace(
+            stop_event=Event(),
+            review_lock=Lock(),
+            review_items=[
+                {"id": index, "path": Path(f"IMG_{index}.mp4")}
+                for index in range(items)
+            ],
+            scan_complete=scan_complete,
+            transcriber=transcriber,
+            transcripts={},
+            transcript_priority=None,
+            transcription_failed=False,
+        )
+
+    def test_disabled_without_a_transcriber(self):
+        server = self._server()
+
+        response = video_rename._transcript_response(server, server.review_items[0])
+
+        assert response == {"status": "disabled"}
+
+    def test_pending_request_prioritizes_the_video_on_screen(self):
+        server = self._server(transcriber=MagicMock(), items=3)
+
+        response = video_rename._transcript_response(server, server.review_items[2])
+
+        assert response == {"status": "pending"}
+        item, _path = video_rename._next_transcript_item(server)
+        assert item["id"] == 2
+
+    def test_works_ahead_of_the_reviewer(self):
+        server = self._server(transcriber=MagicMock(), items=4)
+        server.transcript_priority = 1
+        server.transcripts = {1: {"status": "ready"}}
+
+        item, _path = video_rename._next_transcript_item(server)
+
+        assert item["id"] == 2
+
+    def test_background_worker_transcribes_and_suggests(self):
+        transcriber = MagicMock()
+        transcriber.transcript.side_effect = [
+            "Ophiocordyceps australis on an ant",
+            None,
+        ]
+        server = self._server(transcriber=transcriber)
+
+        video_rename._transcribe_review_items(server)
+
+        assert server.transcripts[0]["status"] == "ready"
+        assert server.transcripts[0]["suggestion"].startswith(
+            "Ophiocordyceps australis"
+        )
+        assert server.transcripts[1] == {"status": "unavailable"}
+        response = video_rename._transcript_response(server, server.review_items[0])
+        assert response["transcript"] == "Ophiocordyceps australis on an ant"
+
+    def test_unavailable_recognizer_stops_waiting_in_the_browser(self, capsys):
+        transcriber = MagicMock()
+        transcriber.transcript.side_effect = video_rename.TranscriberUnavailable(
+            "No speech recognizer is installed."
+        )
+        server = self._server(transcriber=transcriber)
+
+        video_rename._transcribe_review_items(server)
+
+        response = video_rename._transcript_response(server, server.review_items[1])
+        assert response == {"status": "unavailable"}
+        assert "Transcription stopped" in capsys.readouterr().out
+
+    def test_items_response_reports_whether_transcripts_are_on(self):
+        server = self._server(transcriber=MagicMock())
+        server.scan_progress = server.scan_total = 2
+        server.dry_run = False
+
+        # Asking only for items past the end keeps this about the flag itself.
+        assert _review_items_response(server, 2)["transcripts"] is True
+
+    def test_suggestion_is_only_used_when_asked(self):
+        # The description stays empty until the reviewer presses Tab or the
+        # suggestion button, so a suggestion is never saved by accident.
+        assert "input.value = info.suggestion" in _INTERACTIVE_HTML
+        assert "event.key === 'Tab'" in _INTERACTIVE_HTML
+        assert "$('description').value = item.description || '';" in (_INTERACTIVE_HTML)
+
+
+class TestCatalogArguments:
+    @pytest.mark.parametrize(
+        "extra, message",
+        [
+            (["--catalog", "c.csv", "--interactive"], "cannot be combined"),
+            (["--transcribe"], "--transcribe can only be used"),
+        ],
+    )
+    @patch("video_rename.get_video_files")
+    def test_invalid_combinations_are_rejected_before_scanning(
+        self, get_files, extra, message, capsys
+    ):
+        argv = ["video_rename.py", "/videos"] + extra
+        with patch.object(sys, "argv", argv), pytest.raises(SystemExit) as exit_info:
+            video_rename.main()
+
+        assert exit_info.value.code == 2
+        get_files.assert_not_called()
+        assert message in capsys.readouterr().err
+
+    @patch("video_rename.write_catalog", return_value=2)
+    @patch("video_rename.get_video_files")
+    def test_catalog_mode_does_not_rename(self, get_files, write, tmp_path, capsys):
+        get_files.return_value = [tmp_path / "b.mp4", tmp_path / "A.mp4"]
+        argv = ["video_rename.py", str(tmp_path), "--catalog", "clips.csv"]
+
+        with (
+            patch.object(sys, "argv", argv),
+            patch("video_rename.EXIFTOOL_PATH", "/usr/bin/exiftool"),
+            patch("video_rename.process_file") as process,
+        ):
+            video_rename.main()
+
+        process.assert_not_called()
+        files, output, base_dir, transcriber, _debug = write.call_args.args
+        assert [path.name for path in files] == ["A.mp4", "b.mp4"]
+        assert output == "clips.csv"
+        assert base_dir == tmp_path.resolve()
+        assert transcriber is None
+        assert "Wrote 2 video(s) to clips.csv" in capsys.readouterr().out

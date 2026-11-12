@@ -84,6 +84,28 @@ The review server only listens on `127.0.0.1`, validates the local request host,
 requires JSON for every modifying request, and stops when you finish. You can
 combine `--interactive` with `--recursive` or `--dry-run`.
 
+### Suggested descriptions from speech
+
+Add `--transcribe` to have the review screen listen to each video and suggest
+a description from what is said in it:
+
+```bash
+python3 video_rename.py /path/to/videos --interactive --transcribe
+```
+
+The first three minutes of each video's audio are transcribed on your own
+computer with [Whisper](https://github.com/openai/whisper); nothing is uploaded.
+Transcription runs in the background, starting with the video on screen and
+working ahead. Under the description field, **Heard in this clip** shows the
+transcript and a suggestion. Species names such as *Amanita muscaria* come
+first, followed by the most frequent meaningful words. The suggestion is never
+saved unless you choose it: press **Tab** in an empty description field or
+click the suggestion, then edit it if you like.
+
+Transcripts are cached in `transcripts.json` next to the geocoding cache. They
+are keyed by file content and model, so renamed videos are not transcribed
+again.
+
 Location lookup uses OpenStreetMap's Nominatim service conservatively: requests
 are serialized and limited to at most one every 1.1 seconds, nearby coordinates
 share a cache entry, and successful/no-result lookups are persisted at
@@ -96,12 +118,32 @@ or your own instance. Location data is ©
 [OpenStreetMap contributors](https://www.openstreetmap.org/copyright); see the
 [public Nominatim usage policy](https://operations.osmfoundation.org/policies/nominatim/).
 
+## Clip catalog
+
+`--catalog` writes a spreadsheet (CSV) describing every video and renames
+nothing:
+
+```bash
+python3 video_rename.py /path/to/videos --recursive --catalog clips.csv
+```
+
+Columns: `path`, `filename`, `description`, `date`, `location`, `orientation`,
+`duration`, `duration_seconds`, `width`, `height` and `size_mb`. With
+`--transcribe`, `suggested_description` and `transcript` columns are added,
+which makes clips searchable by what was said in them. The file opens directly
+in Excel, Numbers or Google Sheets. Locations are looked up with the same
+rate-limited, cached geocoding as renaming, so the first catalog of a large,
+GPS-tagged collection takes about a second per new place.
+
 ## Requirements
 
 - Python 3.7+
 - `exiftool`: This must be installed and accessible in your system's PATH. You can find installation instructions at [exiftool.org](https://exiftool.org/install.html).
 - `ffmpeg` and `ffprobe`: Optional, but recommended for browser-compatible audio previews.
 - `geopy` Python library.
+- For `--transcribe` only: FFmpeg and a Whisper speech recognizer, either
+  `pip install faster-whisper` (recommended; fast on a CPU) or
+  `pip install openai-whisper`. The chosen model is downloaded on first use.
 
 ## Installation
 
@@ -133,6 +175,9 @@ python3 video_rename.py [PATHS...] [OPTIONS]
 -   `--dry-run`: Print the proposed renames without actually changing any files. This is highly recommended for the first run.
 -   `-i`, `--interactive`: Open the video review screen and add descriptions.
 -   `--include-described`: Also show videos that already appear to have a description (interactive mode only).
+-   `--catalog CSV_FILE`: Write a spreadsheet listing every video instead of renaming. Cannot be combined with `--interactive`.
+-   `--transcribe`: Transcribe speech locally to suggest descriptions (`--interactive`) or add transcript columns (`--catalog`).
+-   `--whisper-model NAME`: Whisper model for `--transcribe` (default `base`; `small` is more accurate but slower).
 -   `--debug`: Enable debug printing, which shows detailed metadata (width, height, rotation) for each file processed.
 
 ## Examples
@@ -151,6 +196,16 @@ python3 video_rename.py "/path/to/my/video_001.mp4"
 #### Interactively describe videos in a directory tree
 ```bash
 python3 video_rename.py /path/to/videos --recursive --interactive
+```
+
+#### Interactively describe videos with suggestions from what is said
+```bash
+python3 video_rename.py /path/to/videos --recursive --interactive --transcribe
+```
+
+#### Make a spreadsheet of every clip, including transcripts
+```bash
+python3 video_rename.py /path/to/videos --recursive --catalog clips.csv --transcribe
 ```
 
 #### Rename multiple specific files

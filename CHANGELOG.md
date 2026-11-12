@@ -4,6 +4,23 @@ Notable changes to Video Renamer are documented here. Entries are grouped by
 commit date rather than release tag; the `v1.2` tag covers the 2026-10-24 and
 2026-11-08 sections below.
 
+## Unreleased
+
+### Added
+
+- Added `--catalog CSV_FILE`, which writes a spreadsheet of every video
+  (description, date, location, orientation, duration, resolution and size)
+  without renaming anything. The CSV includes a UTF-8 byte-order mark so
+  Excel shows accented place and species names correctly.
+- Added `--transcribe` for local speech transcription with faster-whisper or
+  openai-whisper. In interactive mode, a **Heard in this clip** panel shows
+  the transcript and a suggested description, used only when the reviewer
+  presses Tab or clicks it. With `--catalog`, it adds `suggested_description`
+  and `transcript` columns.
+- Added `--whisper-model` to choose the Whisper model (default `base`).
+- Transcripts are cached by file content and model, so renaming a video does
+  not cause it to be transcribed again.
+
 ## 2026-11-08
 
 ### Changed
