@@ -803,11 +803,47 @@ def _file_fingerprint(file_path):
     return digest.hexdigest()
 
 
-def _load_speech_backend(model_name):
+# Whisper reads at most about 224 tokens of prompt and silently drops the
+# start of anything longer, so long word lists are warned about.
+VOCABULARY_PROMPT_WARN_CHARS = 800
+
+
+def load_vocabulary(path):
+    """Read a word list for transcription: one term per line.
+
+    Blank lines and lines starting with "#" are ignored, and repeated terms
+    are kept once.  Returns the terms in file order.
+    """
+    terms = []
+    seen = set()
+    for line in Path(path).read_text(encoding="utf-8").splitlines():
+        term = line.strip()
+        if not term or term.startswith("#"):
+            continue
+        folded = term.casefold()
+        if folded not in seen:
+            seen.add(folded)
+            terms.append(term)
+    return terms
+
+
+def vocabulary_prompt(terms):
+    """Turn a word list into a Whisper prompt, or None for an empty list.
+
+    Whisper treats the prompt as text that came just before the audio, so
+    names in it are spelled the same way in the transcript.
+    """
+    if not terms:
+        return None
+    return "Glossary: " + ", ".join(terms) + "."
+
+
+def _load_speech_backend(model_name, prompt=None):
     """Return a callable that transcribes an audio file, or None.
 
     faster-whisper is preferred because it runs well on a CPU; the original
-    openai-whisper package is used when it is the one installed.
+    openai-whisper package is used when it is the one installed.  ``prompt``
+    is passed to Whisper as its initial prompt to guide spelling.
     """
     try:
         from faster_whisper import (  # pylint: disable=import-outside-toplevel
@@ -820,7 +856,9 @@ def _load_speech_backend(model_name):
         model = WhisperModel(model_name, device="auto", compute_type="int8")
 
         def transcribe_faster(audio_path):
-            segments, _info = model.transcribe(str(audio_path), vad_filter=True)
+            segments, _info = model.transcribe(
+                str(audio_path), vad_filter=True, initial_prompt=prompt
+            )
             return " ".join(segment.text.strip() for segment in segments).strip()
 
         return transcribe_faster
@@ -833,7 +871,7 @@ def _load_speech_backend(model_name):
     model = whisper.load_model(model_name)
 
     def transcribe_openai(audio_path):
-        result = model.transcribe(str(audio_path), fp16=False)
+        result = model.transcribe(str(audio_path), fp16=False, initial_prompt=prompt)
         return (result.get("text") or "").strip()
 
     return transcribe_openai
@@ -844,14 +882,23 @@ class Transcriber:
 
     Audio is extracted with FFmpeg and passed to a Whisper model on this
     computer; nothing is sent over the network.  Transcripts are cached by
-    file content and model name, so renamed files are not transcribed twice.
+    file content, model name and word list, so renamed files are not
+    transcribed twice.
     """
 
-    def __init__(self, model_name=DEFAULT_WHISPER_MODEL, backend=None):
+    def __init__(self, model_name=DEFAULT_WHISPER_MODEL, backend=None, prompt=None):
         self.model_name = model_name
+        self.prompt = prompt or None
         self._backend = backend
         self._lock = threading.Lock()
         self._cache = None
+
+    def _cache_prefix(self):
+        """Cache key prefix; a different word list gives fresh transcripts."""
+        if not self.prompt:
+            return self.model_name
+        digest = hashlib.sha256(self.prompt.encode("utf-8")).hexdigest()[:12]
+        return f"{self.model_name}+vocab-{digest}"
 
     def _load_cache(self):
         if self._cache is not None:
@@ -883,7 +930,7 @@ class Transcriber:
     def _ensure_backend(self):
         if self._backend is None:
             try:
-                self._backend = _load_speech_backend(self.model_name)
+                self._backend = _load_speech_backend(self.model_name, self.prompt)
             except Exception as exc:  # e.g. the model cannot be downloaded offline
                 raise TranscriberUnavailable(
                     f"Could not load the '{self.model_name}' speech model "
@@ -946,7 +993,7 @@ class Transcriber:
         Returns None when the video could not be transcribed.
         """
         try:
-            key = f"{self.model_name}:{_file_fingerprint(file_path)}"
+            key = f"{self._cache_prefix()}:{_file_fingerprint(file_path)}"
         except OSError as exc:
             print(f"Warning: Could not read {Path(file_path).name}: {exc}")
             return None
@@ -1043,14 +1090,81 @@ def _move_transcript_file(old_video_path, new_video_path):
         print(f"Warning: Could not rename transcript {old_path.name}: {exc}")
 
 
+class TrashUnavailableError(OSError):
+    """Raised when no way to move a file to the Trash is available."""
+
+
+def move_to_trash(path):
+    """Move a file to the system Trash (Recycle Bin) so it can be recovered.
+
+    Uses the send2trash package when it is installed.  Without it, macOS
+    files are handed to Finder, which keeps "Put Back" working, and Linux
+    files are handed to ``gio trash``.  Files are never deleted outright:
+    if none of these is available, TrashUnavailableError is raised and the
+    file is left where it is.
+    """
+    path = Path(path)
+    if not path.exists():
+        raise FileNotFoundError(str(path))
+
+    try:
+        from send2trash import (  # pylint: disable=import-outside-toplevel
+            send2trash,
+        )
+    except ImportError:
+        send2trash = None
+    if send2trash is not None:
+        send2trash(str(path))
+        return
+
+    if sys.platform == "darwin" and shutil.which("osascript"):
+        script = (
+            "on run argv\n"
+            'tell application "Finder" to delete '
+            "(POSIX file (item 1 of argv) as alias)\n"
+            "end run"
+        )
+        result = subprocess.run(
+            ["osascript", "-e", script, str(path.resolve())],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode == 0:
+            return
+        raise TrashUnavailableError(
+            "Finder could not move the file to the Trash"
+            f" ({result.stderr.strip() or 'unknown error'}). If macOS asked"
+            " whether Terminal may control Finder, allow it and try again."
+        )
+
+    if shutil.which("gio"):
+        result = subprocess.run(
+            ["gio", "trash", str(path)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode == 0:
+            return
+        raise TrashUnavailableError(
+            f"Could not move the file to the Trash: {result.stderr.strip()}"
+        )
+
+    raise TrashUnavailableError(
+        "No Trash is available on this computer, so the file was not deleted."
+        " Install send2trash (pip install send2trash) to enable Delete."
+    )
+
+
 def _remove_transcript_file(video_path):
-    """Remove a saved transcript file whose video was deleted."""
+    """Move a saved transcript file to the Trash along with its video."""
     path = transcript_file_path(video_path)
     if _is_transcript_file(path):
         try:
-            path.unlink()
+            move_to_trash(path)
         except OSError as exc:
-            print(f"Warning: Could not remove transcript {path.name}: {exc}")
+            print(f"Warning: Could not move transcript {path.name} to the Trash: {exc}")
 
 
 # --- Clip catalog ---
@@ -1452,7 +1566,7 @@ async function deleteCurrent() {
   const item = items[position];
   const prompt = dryRun
     ? `Remove “${item.current_name}” from this review?\n\nDry-run mode will not delete the file.`
-    : `Permanently delete “${item.current_name}”?\n\nThis cannot be undone.`;
+    : `Move “${item.current_name}” to the Trash?\n\nYou can restore it from the Trash later.`;
   if (!window.confirm(prompt)) return;
   setBusy(true); $('message').textContent = '';
   const video = $('video'); video.pause(); video.removeAttribute('src'); video.load();
@@ -1816,7 +1930,7 @@ def _stop_preview_conversions(server):
 
 
 def _delete_review_item(server, item):
-    """Delete one reviewed video, or only remove it from a dry-run session."""
+    """Move one reviewed video to the Trash, or only drop it from a dry run."""
     with server.preview_locks_lock:
         item_lock = server.preview_locks.setdefault(item["id"], threading.Lock())
 
@@ -1826,9 +1940,11 @@ def _delete_review_item(server, item):
         source_path = item["path"]
         if not server.dry_run:
             try:
-                source_path.unlink()
+                move_to_trash(source_path)
             except FileNotFoundError as exc:
                 raise ValueError(f"Video no longer exists: {source_path.name}") from exc
+            except OSError as exc:
+                raise ValueError(str(exc)) from exc
             _remove_transcript_file(source_path)
         item["deleted"] = True
 
@@ -2438,6 +2554,13 @@ Examples:
         "Larger models such as 'small' are more accurate but slower.",
     )
     parser.add_argument(
+        "--vocabulary",
+        metavar="TEXT_FILE",
+        help="With --transcribe, a text file of names and terms (one per line)\n"
+        "that are often said in your videos, such as species or people's\n"
+        "names. Whisper is guided to spell them the same way.",
+    )
+    parser.add_argument(
         "--debug",
         action="store_true",
         help="Enable debug printing for orientation detection.",
@@ -2453,6 +2576,8 @@ Examples:
         parser.error("--transcribe can only be used with --interactive or --catalog")
     if args.save_transcripts and not args.transcribe:
         parser.error("--save-transcripts can only be used with --transcribe")
+    if args.vocabulary and not args.transcribe:
+        parser.error("--vocabulary can only be used with --transcribe")
 
     if not EXIFTOOL_PATH:
         print("Error: 'exiftool' is not installed or not in your system's PATH.")
@@ -2476,7 +2601,21 @@ Examples:
         if not FFMPEG_PATH:
             print("Error: --transcribe needs FFmpeg, which is not installed.")
             sys.exit(1)
-        transcriber = Transcriber(args.whisper_model)
+        prompt = None
+        if args.vocabulary:
+            try:
+                terms = load_vocabulary(args.vocabulary)
+            except (OSError, UnicodeDecodeError) as exc:
+                print(f"Error: Could not read the word list {args.vocabulary}: {exc}")
+                sys.exit(1)
+            prompt = vocabulary_prompt(terms)
+            print(f"Using {len(terms)} terms from {Path(args.vocabulary).name}.")
+            if prompt and len(prompt) > VOCABULARY_PROMPT_WARN_CHARS:
+                print(
+                    "Warning: The word list is long; Whisper only reads about the "
+                    "last 200 words of it. Keep the most important terms near the end."
+                )
+        transcriber = Transcriber(args.whisper_model, prompt=prompt)
         try:
             print(f"Loading the '{args.whisper_model}' speech model...")
             transcriber._ensure_backend()  # pylint: disable=protected-access

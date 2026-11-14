@@ -25,6 +25,16 @@ commit date rather than release tag; the `v1.2` tag covers the 2026-10-24 and
   such as Spotlight. The text file is renamed along with its video and removed
   if the video is deleted in the review screen. Text files the program did not
   write are never overwritten, moved or deleted.
+- Added `--vocabulary TEXT_FILE`, a list of names and terms (one per line)
+  given to Whisper as a prompt so species and people's names are spelled
+  consistently. Transcripts are cached separately for each word list.
+
+### Changed
+
+- **Delete…** in the review screen now moves the video (and its saved
+  transcript) to the Trash instead of deleting it permanently. It uses
+  send2trash when installed, otherwise Finder on macOS or `gio trash` on
+  Linux, and refuses to delete if no Trash is available.
 
 ## 2026-11-08
 

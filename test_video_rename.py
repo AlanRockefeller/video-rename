@@ -758,7 +758,7 @@ class TestInteractiveDelete:
             review_lock=Lock(),
         )
 
-    def test_permanent_delete_removes_video(self, tmp_path):
+    def test_delete_moves_video_to_trash(self, tmp_path, fake_trash):
         video = tmp_path / "delete-me.mp4"
         video.write_bytes(b"video")
         item = {"id": 0, "path": video}
@@ -766,7 +766,24 @@ class TestInteractiveDelete:
         assert _delete_review_item(self._server(False), item) == video
 
         assert not video.exists()
+        assert (fake_trash / "delete-me.mp4").read_bytes() == b"video"
         assert item["deleted"] is True
+
+    def test_delete_keeps_video_when_no_trash_is_available(self, tmp_path, monkeypatch):
+        video = tmp_path / "keep-me.mp4"
+        video.write_bytes(b"video")
+        item = {"id": 0, "path": video}
+
+        def no_trash(_path):
+            raise video_rename.TrashUnavailableError("No Trash is available")
+
+        monkeypatch.setattr(video_rename, "move_to_trash", no_trash)
+
+        with pytest.raises(ValueError, match="No Trash"):
+            _delete_review_item(self._server(False), item)
+
+        assert video.exists()
+        assert not item.get("deleted")
 
     def test_dry_run_keeps_video(self, tmp_path):
         video = tmp_path / "keep-me.mp4"
@@ -780,7 +797,8 @@ class TestInteractiveDelete:
 
     def test_interface_requires_explicit_confirmation(self):
         assert "window.confirm(prompt)" in _INTERACTIVE_HTML
-        assert "This cannot be undone." in _INTERACTIVE_HTML
+        assert "to the Trash?" in _INTERACTIVE_HTML
+        assert "cannot be undone" not in _INTERACTIVE_HTML
 
 
 class TestInteractiveServerHardening:
@@ -1326,6 +1344,34 @@ class TestTranscriber:
 
         assert backend.call_count == 2
 
+    def test_cache_is_specific_to_the_word_list(self, tmp_path):
+        backend = MagicMock(return_value="text")
+        video = self._video(tmp_path)
+
+        with patch.object(
+            video_rename.Transcriber, "_extract_audio", return_value=True
+        ):
+            video_rename.Transcriber("base", backend=backend).transcript(video)
+            video_rename.Transcriber(
+                "base", backend=backend, prompt="Glossary: Mycena."
+            ).transcript(video)
+            video_rename.Transcriber(
+                "base", backend=backend, prompt="Glossary: Mycena."
+            ).transcript(video)
+            video_rename.Transcriber(
+                "base", backend=backend, prompt="Glossary: Russula."
+            ).transcript(video)
+
+        assert backend.call_count == 3
+
+    def test_word_list_is_passed_to_the_speech_model(self):
+        with patch("video_rename._load_speech_backend") as load:
+            video_rename.Transcriber(
+                "base", prompt="Glossary: Cordyceps."
+            )._ensure_backend()  # pylint: disable=protected-access
+
+        load.assert_called_once_with("base", "Glossary: Cordyceps.")
+
     def test_video_without_audio_has_empty_transcript(self, tmp_path):
         backend = MagicMock()
         transcriber = video_rename.Transcriber("base", backend=backend)
@@ -1696,7 +1742,7 @@ class TestTranscriptFiles:
         assert transcript_text(item["path"]).endswith("\na lovely beach\n")
         assert not (tmp_path / "IMG_1234_horizontal.txt").exists()
 
-    def test_deleting_a_video_removes_its_transcript(self, tmp_path):
+    def test_deleting_a_video_removes_its_transcript(self, tmp_path, fake_trash):
         video = tmp_path / "delete-me.mp4"
         video.write_bytes(b"v")
         video_rename.save_transcript_file(video, "blurry")
@@ -1706,6 +1752,7 @@ class TestTranscriptFiles:
         )
 
         assert not (tmp_path / "delete-me.txt").exists()
+        assert (fake_trash / "delete-me.txt").exists()
 
     def test_review_saves_transcripts_under_the_current_name(self, tmp_path):
         old = tmp_path / "IMG_7.mp4"
@@ -1769,3 +1816,124 @@ class TestTranscriptFiles:
 
 def transcript_text(video):
     return video_rename.transcript_file_path(video).read_text(encoding="utf-8")
+
+
+@pytest.fixture
+def fake_trash(tmp_path, monkeypatch):
+    """Replace the system Trash with a folder so tests never touch it."""
+    trash = tmp_path / "Trash"
+    trash.mkdir()
+
+    def fake_move_to_trash(path):
+        path = Path(path)
+        if not path.exists():
+            raise FileNotFoundError(str(path))
+        path.rename(trash / path.name)
+
+    monkeypatch.setattr(video_rename, "move_to_trash", fake_move_to_trash)
+    return trash
+
+
+class TestMoveToTrash:
+    def test_uses_send2trash_when_installed(self, tmp_path, monkeypatch):
+        video = tmp_path / "clip.mp4"
+        video.write_bytes(b"v")
+        calls = []
+        module = SimpleNamespace(send2trash=calls.append)
+        monkeypatch.setitem(sys.modules, "send2trash", module)
+
+        video_rename.move_to_trash(video)
+
+        assert calls == [str(video)]
+
+    def test_uses_finder_on_macos(self, tmp_path, monkeypatch):
+        video = tmp_path / "clip.mp4"
+        video.write_bytes(b"v")
+        monkeypatch.setitem(sys.modules, "send2trash", None)
+        monkeypatch.setattr(video_rename.sys, "platform", "darwin")
+        monkeypatch.setattr(
+            video_rename.shutil, "which", lambda name: f"/usr/bin/{name}"
+        )
+        commands = []
+
+        def fake_run(command, **_kwargs):
+            commands.append(command)
+            return SimpleNamespace(returncode=0, stderr="")
+
+        monkeypatch.setattr(video_rename.subprocess, "run", fake_run)
+
+        video_rename.move_to_trash(video)
+
+        assert commands[0][0] == "osascript"
+        assert 'tell application "Finder" to delete' in commands[0][2]
+        assert commands[0][-1] == str(video.resolve())
+
+    def test_finder_failure_raises_and_keeps_file(self, tmp_path, monkeypatch):
+        video = tmp_path / "clip.mp4"
+        video.write_bytes(b"v")
+        monkeypatch.setitem(sys.modules, "send2trash", None)
+        monkeypatch.setattr(video_rename.sys, "platform", "darwin")
+        monkeypatch.setattr(
+            video_rename.shutil, "which", lambda name: f"/usr/bin/{name}"
+        )
+        monkeypatch.setattr(
+            video_rename.subprocess,
+            "run",
+            lambda *_a, **_k: SimpleNamespace(returncode=1, stderr="Not allowed"),
+        )
+
+        with pytest.raises(video_rename.TrashUnavailableError, match="Not allowed"):
+            video_rename.move_to_trash(video)
+        assert video.exists()
+
+    def test_never_deletes_when_no_trash_exists(self, tmp_path, monkeypatch):
+        video = tmp_path / "clip.mp4"
+        video.write_bytes(b"v")
+        monkeypatch.setitem(sys.modules, "send2trash", None)
+        monkeypatch.setattr(video_rename.sys, "platform", "linux")
+        monkeypatch.setattr(video_rename.shutil, "which", lambda _name: None)
+
+        with pytest.raises(video_rename.TrashUnavailableError, match="send2trash"):
+            video_rename.move_to_trash(video)
+        assert video.exists()
+
+    def test_missing_file_raises_file_not_found(self, tmp_path):
+        with pytest.raises(FileNotFoundError):
+            video_rename.move_to_trash(tmp_path / "gone.mp4")
+
+
+class TestVocabulary:
+    def test_reads_terms_skipping_comments_blanks_and_repeats(self, tmp_path):
+        word_list = tmp_path / "words.txt"
+        word_list.write_text(
+            "# Genera\nMycena\n\n  Cordyceps  \nmycena\n# People\nAlan Rockefeller\n",
+            encoding="utf-8",
+        )
+
+        assert video_rename.load_vocabulary(word_list) == [
+            "Mycena",
+            "Cordyceps",
+            "Alan Rockefeller",
+        ]
+
+    def test_prompt_lists_the_terms(self):
+        assert (
+            video_rename.vocabulary_prompt(["Mycena", "Lepiota luteophylla"])
+            == "Glossary: Mycena, Lepiota luteophylla."
+        )
+
+    def test_empty_list_gives_no_prompt(self):
+        assert video_rename.vocabulary_prompt([]) is None
+
+    def test_faster_whisper_receives_the_prompt(self, monkeypatch):
+        model = MagicMock()
+        model.transcribe.return_value = ([SimpleNamespace(text=" Mycena ")], None)
+        module = SimpleNamespace(WhisperModel=MagicMock(return_value=model))
+        monkeypatch.setitem(sys.modules, "faster_whisper", module)
+
+        backend = video_rename._load_speech_backend("base", "Glossary: Mycena.")
+
+        assert backend("clip.wav") == "Mycena"
+        assert model.transcribe.call_args.kwargs["initial_prompt"] == (
+            "Glossary: Mycena."
+        )

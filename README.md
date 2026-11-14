@@ -69,8 +69,12 @@ Useful controls:
 - `Ctrl+Enter`: rename and go to the next video
 - `Ctrl+Right Arrow`: skip to the next video
 - `Alt+Left/Right Arrow`: seek backward or forward five seconds
-- **Delete…**: permanently delete the current video after confirming its exact
-  filename (`--dry-run` only removes it from the current review)
+- **Delete…**: move the current video to the Trash (Recycle Bin) after
+  confirming its exact filename, so it can be restored later (`--dry-run` only
+  removes it from the current review). Delete uses the
+  [send2trash](https://pypi.org/project/send2trash/) package when installed,
+  otherwise Finder on macOS or `gio trash` on Linux. If none is available the
+  video is left in place and an error is shown; it is never deleted outright.
 - **Open in video player**: use the system player when the browser does not
   support a video's codec
 
@@ -111,8 +115,16 @@ its video, with the same name and a `.txt` extension (for example
 `IMG_6426_amanita_2023-12-09_vertical.txt`). These files can be searched with
 Spotlight or any desktop search, and they stay paired with their video: when a
 video is renamed, its transcript file is renamed too, and deleting a video in
-the review screen deletes its transcript file. Silent videos get no file, and a
+the review screen moves its transcript file to the Trash with it. Silent videos get no file, and a
 text file the program did not write is never overwritten, moved or deleted.
+
+Add `--vocabulary words.txt` to help Whisper spell names it would otherwise
+guess at, such as species, places and people. The file has one term per line;
+blank lines and lines starting with `#` are ignored. The terms are given to
+Whisper as a prompt, which only nudges spelling and does not limit what it can
+hear. Whisper reads only about the last 200 words of a prompt, so keep the list
+short and put the most important terms at the end. Changing the list gives
+fresh transcripts rather than reusing cached ones.
 
 Location lookup uses OpenStreetMap's Nominatim service conservatively: requests
 are serialized and limited to at most one every 1.1 seconds, nearby coordinates
@@ -187,6 +199,7 @@ python3 video_rename.py [PATHS...] [OPTIONS]
 -   `--transcribe`: Transcribe speech locally to suggest descriptions (`--interactive`) or add transcript columns (`--catalog`).
 -   `--save-transcripts`: With `--transcribe`, also save each transcript as a searchable `.txt` file beside its video.
 -   `--whisper-model NAME`: Whisper model for `--transcribe` (default `base`; `small` is more accurate but slower).
+-   `--vocabulary TEXT_FILE`: With `--transcribe`, a list of names and terms (one per line) that Whisper should spell correctly.
 -   `--debug`: Enable debug printing, which shows detailed metadata (width, height, rotation) for each file processed.
 
 ## Examples
