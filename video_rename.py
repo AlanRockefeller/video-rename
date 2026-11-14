@@ -803,9 +803,10 @@ def _file_fingerprint(file_path):
     return digest.hexdigest()
 
 
-# Whisper reads at most about 224 tokens of prompt and silently drops the
-# start of anything longer, so long word lists are warned about.
-VOCABULARY_PROMPT_WARN_CHARS = 800
+# Whisper keeps only the last ~223 tokens of a prompt and silently drops the
+# start of anything longer.  Scientific names split into many tokens (about
+# 2.6 characters each), so lists beyond ~600 characters are warned about.
+VOCABULARY_PROMPT_WARN_CHARS = 600
 
 
 def load_vocabulary(path):
@@ -2612,8 +2613,9 @@ Examples:
             print(f"Using {len(terms)} terms from {Path(args.vocabulary).name}.")
             if prompt and len(prompt) > VOCABULARY_PROMPT_WARN_CHARS:
                 print(
-                    "Warning: The word list is long; Whisper only reads about the "
-                    "last 200 words of it. Keep the most important terms near the end."
+                    "Warning: The word list is long; Whisper only reads roughly the "
+                    "last 600 characters of it. Keep the most important terms near "
+                    "the end."
                 )
         transcriber = Transcriber(args.whisper_model, prompt=prompt)
         try:

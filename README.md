@@ -122,8 +122,9 @@ Add `--vocabulary words.txt` to help Whisper spell names it would otherwise
 guess at, such as species, places and people. The file has one term per line;
 blank lines and lines starting with `#` are ignored. The terms are given to
 Whisper as a prompt, which only nudges spelling and does not limit what it can
-hear. Whisper reads only about the last 200 words of a prompt, so keep the list
-short and put the most important terms at the end. Changing the list gives
+hear. Whisper reads only the last ~223 tokens of a prompt, which is roughly 600
+characters or 40–50 scientific names, so keep the list short and put the most
+important terms at the end. The program warns when a list is longer. Changing the list gives
 fresh transcripts rather than reusing cached ones.
 
 Location lookup uses OpenStreetMap's Nominatim service conservatively: requests
