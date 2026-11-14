@@ -4,6 +4,38 @@ Notable changes to Video Renamer are documented here. Entries are grouped by
 commit date rather than release tag; the `v1.2` tag covers the 2026-10-24 and
 2026-11-08 sections below.
 
+## Unreleased
+
+### Added
+
+- Added `--catalog CSV_FILE`, which writes a spreadsheet of every video
+  (description, date, location, orientation, duration, resolution and size)
+  without renaming anything. The CSV includes a UTF-8 byte-order mark so
+  Excel shows accented place and species names correctly.
+- Added `--transcribe` for local speech transcription with faster-whisper or
+  openai-whisper. In interactive mode, a **Heard in this clip** panel shows
+  the transcript and a suggested description, used only when the reviewer
+  presses Tab or clicks it. With `--catalog`, it adds `suggested_description`
+  and `transcript` columns.
+- Added `--whisper-model` to choose the Whisper model (default `base`).
+- Transcripts are cached by file content and model, so renaming a video does
+  not cause it to be transcribed again.
+- Added `--save-transcripts`, which also saves each transcript as a text file
+  next to its video (same name, `.txt`) so it can be found with desktop search
+  such as Spotlight. The text file is renamed along with its video and removed
+  if the video is deleted in the review screen. Text files the program did not
+  write are never overwritten, moved or deleted.
+- Added `--vocabulary TEXT_FILE`, a list of names and terms (one per line)
+  given to Whisper as a prompt so species and people's names are spelled
+  consistently. Transcripts are cached separately for each word list.
+
+### Changed
+
+- **Delete…** in the review screen now moves the video (and its saved
+  transcript) to the Trash instead of deleting it permanently. It uses
+  send2trash when installed, otherwise Finder on macOS or `gio trash` on
+  Linux, and refuses to delete if no Trash is available.
+
 ## 2026-11-08
 
 ### Changed

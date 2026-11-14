@@ -5,6 +5,8 @@
 # October 24, 2026
 
 import argparse
+import csv
+import hashlib
 import json
 import mimetypes
 import os
@@ -683,6 +685,629 @@ def _get_display_name(file_path, is_recursive, base_dir):
     return str(file_path.name)
 
 
+# --- Speech transcription and description suggestions ---
+
+# Only the start of a clip is transcribed: it is where people usually say what
+# they are filming, and it keeps transcription quick on long recordings.
+TRANSCRIPT_MAX_SECONDS = 180
+TRANSCRIPT_TIMEOUT_SECONDS = 300
+DEFAULT_WHISPER_MODEL = "base"
+SUGGESTION_MAX_WORDS = 6
+_FINGERPRINT_BYTES = 1024 * 1024
+
+# Words that carry little meaning in a filename.  Kept lowercase.
+_SUGGESTION_STOPWORDS = frozenset(
+    """
+    a about above actually after again against all almost also always am an and
+    another any anything are around as at away back be because been before being
+    below between both but by can come comes coming could did do does doing done
+    down during each even ever every everything few find for found from get gets
+    getting go goes going gonna good got great guys had has have having he her here
+    hers him his how i if in into is it its just kind know let lets like little
+    look looking looks lot lots made make many maybe me more most much my need new
+    nice no not now of off oh okay on once one only or other our out over really
+    right said say see seen she should show so some something still such sure take
+    than that the their them then there these they thing things think this those
+    through to today too up us very want was way we well were what when where which
+    while who why will with would wow yeah yes yet you your
+    """.split()  # noqa: SIM905 - easier to read and edit as prose
+)
+# A capitalized word followed by a lowercase word with a typical Latin
+# species ending, such as "Amanita muscaria" or "Ophiocordyceps australis".
+_SPECIES_NAME_RE = re.compile(
+    r"\b([A-Z][a-z]{2,})\s+([a-z]{3,}(?:us|um|is|ii|ae|ensis|oides|ata|ica"
+    r"|ens|ans|ax|ex|or|ia|ea|a|i))\b"
+)
+# Everyday words that happen to end like a Latin epithet, so that phrases such
+# as "Bioluminescent fungi" or "Giant fungus" are not taken for species names.
+_NOT_EPITHETS = frozenset(
+    """
+    area banana bonus cactus camera campus chorus data delta extra focus fungi
+    fungus genus idea media mycelia octopus opus pasta pizza plus sofa status taxi
+    tuna ultra virus
+    """.split()  # noqa: SIM905 - easier to read and edit as prose
+)
+_TRANSCRIPT_WORD_RE = re.compile(r"[A-Za-z][A-Za-z'-]*[A-Za-z]")
+
+
+def suggest_description(transcript, max_words=SUGGESTION_MAX_WORDS):
+    """Suggest a short filename description from what is said in a clip.
+
+    Species names (a capitalized genus and a Latin-looking epithet) come first
+    because narrators usually name what they are filming; the most frequent
+    remaining meaningful words fill the rest, in the order they were spoken.
+    Returns an empty string when nothing useful was said.
+    """
+    if not transcript:
+        return ""
+
+    chosen = []
+    seen = set()
+
+    def add(word):
+        key = word.lower()
+        if key in seen or len(chosen) >= max_words:
+            return False
+        seen.add(key)
+        chosen.append(word)
+        return True
+
+    for genus, epithet in _SPECIES_NAME_RE.findall(transcript):
+        if genus.lower() in _SUGGESTION_STOPWORDS or epithet in _NOT_EPITHETS:
+            continue
+        if len(chosen) + 2 > max_words:
+            break
+        if genus.lower() not in seen:
+            add(genus)
+            add(epithet)
+
+    counts = {}
+    first_index = {}
+    for index, match in enumerate(_TRANSCRIPT_WORD_RE.finditer(transcript)):
+        word = match.group().lower()
+        word = re.sub(r"'s$", "", word)
+        if len(word) < 4 or word in _SUGGESTION_STOPWORDS or "'" in word:
+            continue
+        counts[word] = counts.get(word, 0) + 1
+        first_index.setdefault(word, index)
+
+    remaining = max_words - len(chosen)
+    if remaining > 0:
+        ranked = sorted(counts, key=lambda word: (-counts[word], first_index[word]))
+        keywords = [word for word in ranked if word not in seen][:remaining]
+        for word in sorted(keywords, key=lambda word: first_index[word]):
+            add(word)
+
+    return " ".join(chosen)
+
+
+class TranscriberUnavailable(RuntimeError):
+    """Raised when speech transcription cannot run on this computer at all."""
+
+
+def _transcript_cache_path():
+    """Return the persistent transcript cache path, respecting XDG_CACHE_HOME."""
+    return _geocode_cache_path().with_name("transcripts.json")
+
+
+def _file_fingerprint(file_path):
+    """Identify a video by its content so a cached transcript survives renames."""
+    digest = hashlib.sha256()
+    with Path(file_path).open("rb") as source:
+        size = os.fstat(source.fileno()).st_size
+        digest.update(str(size).encode("ascii"))
+        digest.update(source.read(_FINGERPRINT_BYTES))
+        if size > 2 * _FINGERPRINT_BYTES:
+            source.seek(size - _FINGERPRINT_BYTES)
+            digest.update(source.read(_FINGERPRINT_BYTES))
+    return digest.hexdigest()
+
+
+# Whisper reads at most about 224 tokens of prompt and silently drops the
+# start of anything longer, so long word lists are warned about.
+VOCABULARY_PROMPT_WARN_CHARS = 800
+
+
+def load_vocabulary(path):
+    """Read a word list for transcription: one term per line.
+
+    Blank lines and lines starting with "#" are ignored, and repeated terms
+    are kept once.  Returns the terms in file order.
+    """
+    terms = []
+    seen = set()
+    for line in Path(path).read_text(encoding="utf-8").splitlines():
+        term = line.strip()
+        if not term or term.startswith("#"):
+            continue
+        folded = term.casefold()
+        if folded not in seen:
+            seen.add(folded)
+            terms.append(term)
+    return terms
+
+
+def vocabulary_prompt(terms):
+    """Turn a word list into a Whisper prompt, or None for an empty list.
+
+    Whisper treats the prompt as text that came just before the audio, so
+    names in it are spelled the same way in the transcript.
+    """
+    if not terms:
+        return None
+    return "Glossary: " + ", ".join(terms) + "."
+
+
+def _load_speech_backend(model_name, prompt=None):
+    """Return a callable that transcribes an audio file, or None.
+
+    faster-whisper is preferred because it runs well on a CPU; the original
+    openai-whisper package is used when it is the one installed.  ``prompt``
+    is passed to Whisper as its initial prompt to guide spelling.
+    """
+    try:
+        from faster_whisper import (  # pylint: disable=import-outside-toplevel
+            WhisperModel,
+        )
+    except ImportError:
+        WhisperModel = None  # pylint: disable=invalid-name
+
+    if WhisperModel is not None:
+        model = WhisperModel(model_name, device="auto", compute_type="int8")
+
+        def transcribe_faster(audio_path):
+            segments, _info = model.transcribe(
+                str(audio_path), vad_filter=True, initial_prompt=prompt
+            )
+            return " ".join(segment.text.strip() for segment in segments).strip()
+
+        return transcribe_faster
+
+    try:
+        import whisper  # pylint: disable=import-outside-toplevel
+    except ImportError:
+        return None
+
+    model = whisper.load_model(model_name)
+
+    def transcribe_openai(audio_path):
+        result = model.transcribe(str(audio_path), fp16=False, initial_prompt=prompt)
+        return (result.get("text") or "").strip()
+
+    return transcribe_openai
+
+
+class Transcriber:
+    """Transcribe the start of each video locally, caching results on disk.
+
+    Audio is extracted with FFmpeg and passed to a Whisper model on this
+    computer; nothing is sent over the network.  Transcripts are cached by
+    file content, model name and word list, so renamed files are not
+    transcribed twice.
+    """
+
+    def __init__(self, model_name=DEFAULT_WHISPER_MODEL, backend=None, prompt=None):
+        self.model_name = model_name
+        self.prompt = prompt or None
+        self._backend = backend
+        self._lock = threading.Lock()
+        self._cache = None
+
+    def _cache_prefix(self):
+        """Cache key prefix; a different word list gives fresh transcripts."""
+        if not self.prompt:
+            return self.model_name
+        digest = hashlib.sha256(self.prompt.encode("utf-8")).hexdigest()[:12]
+        return f"{self.model_name}+vocab-{digest}"
+
+    def _load_cache(self):
+        if self._cache is not None:
+            return
+        self._cache = {}
+        try:
+            data = json.loads(_transcript_cache_path().read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                self._cache.update(
+                    (key, value)
+                    for key, value in data.items()
+                    if isinstance(key, str) and isinstance(value, str)
+                )
+        except (FileNotFoundError, OSError, json.JSONDecodeError):
+            return
+
+    def _save_cache(self):
+        cache_path = _transcript_cache_path()
+        temporary_path = cache_path.with_name(f"{cache_path.name}.{os.getpid()}.tmp")
+        try:
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            temporary_path.write_text(
+                json.dumps(self._cache, sort_keys=True), encoding="utf-8"
+            )
+            temporary_path.replace(cache_path)
+        except OSError as exc:
+            print(f"Warning: Could not save transcript cache: {exc}")
+
+    def _ensure_backend(self):
+        if self._backend is None:
+            try:
+                self._backend = _load_speech_backend(self.model_name, self.prompt)
+            except Exception as exc:  # e.g. the model cannot be downloaded offline
+                raise TranscriberUnavailable(
+                    f"Could not load the '{self.model_name}' speech model "
+                    f"(it is downloaded on first use): {exc}"
+                ) from exc
+            if self._backend is None:
+                raise TranscriberUnavailable(
+                    "No speech recognizer is installed. Install one with "
+                    "'pip install faster-whisper' (or 'pip install openai-whisper')."
+                )
+        return self._backend
+
+    @staticmethod
+    def _extract_audio(file_path, audio_path):
+        """Write the start of a video's audio as 16 kHz mono WAV.
+
+        Returns False when the video has no audio track to transcribe.
+        """
+        if not FFMPEG_PATH:
+            raise TranscriberUnavailable("FFmpeg is required to transcribe videos.")
+        command = [
+            FFMPEG_PATH,
+            "-nostdin",
+            "-v",
+            "error",
+            "-y",
+            "-i",
+            str(file_path),
+            "-t",
+            str(TRANSCRIPT_MAX_SECONDS),
+            "-map",
+            "0:a:0?",
+            "-vn",
+            "-ac",
+            "1",
+            "-ar",
+            "16000",
+            str(audio_path),
+        ]
+        try:
+            subprocess.run(
+                command,
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=TRANSCRIPT_TIMEOUT_SECONDS,
+            )
+        except subprocess.CalledProcessError as exc:
+            # With no audio stream the optional map selects nothing, which
+            # FFmpeg reports as an output without streams.
+            if "does not contain any stream" in (exc.stderr or ""):
+                return False
+            raise
+        # A WAV header alone is 44 bytes; anything shorter holds no audio.
+        return audio_path.exists() and audio_path.stat().st_size > 44
+
+    def transcript(self, file_path):
+        """Return the transcript of a video's speech ("" when nothing is said).
+
+        Returns None when the video could not be transcribed.
+        """
+        try:
+            key = f"{self._cache_prefix()}:{_file_fingerprint(file_path)}"
+        except OSError as exc:
+            print(f"Warning: Could not read {Path(file_path).name}: {exc}")
+            return None
+
+        with self._lock:
+            self._load_cache()
+            if key in self._cache:
+                return self._cache[key]
+            try:
+                backend = self._ensure_backend()
+                with tempfile.TemporaryDirectory(
+                    prefix="video-rename-audio-"
+                ) as directory:
+                    audio_path = Path(directory) / "audio.wav"
+                    if self._extract_audio(file_path, audio_path):
+                        text = backend(audio_path)
+                    else:
+                        text = ""
+            except TranscriberUnavailable:
+                raise
+            except Exception as exc:  # noqa: BLE001 - one bad file must not stop a run
+                print(f"Warning: Could not transcribe {Path(file_path).name}: {exc}")
+                return None
+            text = re.sub(r"\s+", " ", text or "").strip()
+            self._cache[key] = text
+            self._save_cache()
+            return text
+
+
+# --- Transcript files ---
+
+TRANSCRIPT_FILE_MARKER = "# Transcript written by video-rename"
+
+
+def transcript_file_path(video_path):
+    """Return the text file that holds a video's transcript, beside the video."""
+    video_path = Path(video_path)
+    return video_path.with_name(f"{video_path.stem}.txt")
+
+
+def _is_transcript_file(path):
+    """Return True if path is a transcript file this program wrote."""
+    try:
+        with Path(path).open(encoding="utf-8") as handle:
+            return handle.readline().rstrip("\r\n") == TRANSCRIPT_FILE_MARKER
+    except (OSError, UnicodeDecodeError):
+        return False
+
+
+def save_transcript_file(video_path, transcript, model_name=None):
+    """Save a transcript as a text file beside its video.
+
+    Silent videos get no file. A text file with the same name that this
+    program did not write is never overwritten. Returns the path written,
+    or None.
+    """
+    if not transcript:
+        return None
+    path = transcript_file_path(video_path)
+    if path.exists() and not _is_transcript_file(path):
+        print(f"Warning: Not saving transcript; {path.name} already exists.")
+        return None
+    lines = [TRANSCRIPT_FILE_MARKER]
+    if model_name:
+        lines.append(
+            f"Speech model: {Path(str(model_name)).name}. Covers up to the first "
+            f"{TRANSCRIPT_MAX_SECONDS // 60} minutes of the video."
+        )
+    content = "\n".join(lines) + f"\n\n{transcript}\n"
+    try:
+        if path.exists() and path.read_text(encoding="utf-8") == content:
+            return path
+        temporary_path = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+        temporary_path.write_text(content, encoding="utf-8")
+        temporary_path.replace(path)
+    except OSError as exc:
+        print(f"Warning: Could not save transcript {path.name}: {exc}")
+        return None
+    return path
+
+
+def _move_transcript_file(old_video_path, new_video_path):
+    """Keep a saved transcript file paired with its video after a rename."""
+    old_path = transcript_file_path(old_video_path)
+    new_path = transcript_file_path(new_video_path)
+    if str(old_path) == str(new_path) or not _is_transcript_file(old_path):
+        return
+    if new_path.exists() and not _same_file(old_path, new_path):
+        print(f"Warning: Transcript not renamed; {new_path.name} already exists.")
+        return
+    try:
+        old_path.rename(new_path)
+    except OSError as exc:
+        print(f"Warning: Could not rename transcript {old_path.name}: {exc}")
+
+
+class TrashUnavailableError(OSError):
+    """Raised when no way to move a file to the Trash is available."""
+
+
+def move_to_trash(path):
+    """Move a file to the system Trash (Recycle Bin) so it can be recovered.
+
+    Uses the send2trash package when it is installed.  Without it, macOS
+    files are handed to Finder, which keeps "Put Back" working, and Linux
+    files are handed to ``gio trash``.  Files are never deleted outright:
+    if none of these is available, TrashUnavailableError is raised and the
+    file is left where it is.
+    """
+    path = Path(path)
+    if not path.exists():
+        raise FileNotFoundError(str(path))
+
+    try:
+        from send2trash import (  # pylint: disable=import-outside-toplevel
+            send2trash,
+        )
+    except ImportError:
+        send2trash = None
+    if send2trash is not None:
+        send2trash(str(path))
+        return
+
+    if sys.platform == "darwin" and shutil.which("osascript"):
+        script = (
+            "on run argv\n"
+            'tell application "Finder" to delete '
+            "(POSIX file (item 1 of argv) as alias)\n"
+            "end run"
+        )
+        result = subprocess.run(
+            ["osascript", "-e", script, str(path.resolve())],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode == 0:
+            return
+        raise TrashUnavailableError(
+            "Finder could not move the file to the Trash"
+            f" ({result.stderr.strip() or 'unknown error'}). If macOS asked"
+            " whether Terminal may control Finder, allow it and try again."
+        )
+
+    if shutil.which("gio"):
+        result = subprocess.run(
+            ["gio", "trash", str(path)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode == 0:
+            return
+        raise TrashUnavailableError(
+            f"Could not move the file to the Trash: {result.stderr.strip()}"
+        )
+
+    raise TrashUnavailableError(
+        "No Trash is available on this computer, so the file was not deleted."
+        " Install send2trash (pip install send2trash) to enable Delete."
+    )
+
+
+def _remove_transcript_file(video_path):
+    """Move a saved transcript file to the Trash along with its video."""
+    path = transcript_file_path(video_path)
+    if _is_transcript_file(path):
+        try:
+            move_to_trash(path)
+        except OSError as exc:
+            print(f"Warning: Could not move transcript {path.name} to the Trash: {exc}")
+
+
+# --- Clip catalog ---
+
+CATALOG_FIELDS = (
+    "path",
+    "filename",
+    "description",
+    "date",
+    "location",
+    "orientation",
+    "duration",
+    "duration_seconds",
+    "width",
+    "height",
+    "size_mb",
+)
+
+
+def _format_duration(seconds):
+    """Format a duration in seconds as H:MM:SS or M:SS."""
+    total = round(seconds)
+    hours, remainder = divmod(total, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours:
+        return f"{hours}:{minutes:02d}:{secs:02d}"
+    return f"{minutes}:{secs:02d}"
+
+
+def _duration_seconds(exif_data):
+    """Return the video duration in seconds from exiftool data, if known."""
+    value = exif_data.get("Duration")
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        return None
+    return seconds if seconds >= 0 else None
+
+
+def build_catalog_row(
+    file_path, base_dir=None, transcriber=None, debug=False, save_transcripts=False
+):
+    """Describe one video for the clip catalog."""
+    exif_data = get_exif_data(file_path)
+    width = exif_data.get("ImageWidth")
+    height = exif_data.get("ImageHeight")
+    orientation = get_orientation(width, height, _parse_rotation(exif_data))
+    date_str = _get_video_date(exif_data, file_path.stem)
+    location_str = get_location_info(
+        exif_data.get("GPSLatitude"), exif_data.get("GPSLongitude")
+    )
+    _base_stem, description = _description_parts(
+        file_path.stem, date_str, location_str, orientation
+    )
+    seconds = _duration_seconds(exif_data)
+    try:
+        size_mb = round(file_path.stat().st_size / (1024 * 1024), 1)
+    except OSError:
+        size_mb = ""
+
+    display_path = str(file_path)
+    if base_dir:
+        try:
+            display_path = str(file_path.relative_to(base_dir))
+        except ValueError:
+            pass
+
+    row = {
+        "path": display_path,
+        "filename": file_path.name,
+        "description": description,
+        "date": date_str or "",
+        "location": location_str or "",
+        "orientation": orientation,
+        "duration": _format_duration(seconds) if seconds is not None else "",
+        "duration_seconds": round(seconds, 1) if seconds is not None else "",
+        "width": width if width is not None else "",
+        "height": height if height is not None else "",
+        "size_mb": size_mb,
+    }
+    if transcriber is not None:
+        transcript = transcriber.transcript(file_path)
+        row["transcript"] = transcript or ""
+        row["suggested_description"] = suggest_description(transcript)
+        if save_transcripts:
+            save_transcript_file(file_path, transcript, transcriber.model_name)
+    if debug:
+        print(f"[DEBUG] catalog row: {row}")
+    return row
+
+
+def write_catalog(
+    video_files,
+    output_path,
+    base_dir=None,
+    transcriber=None,
+    debug=False,
+    save_transcripts=False,
+):
+    """Write a spreadsheet (CSV) describing every video, without renaming any.
+
+    Returns the number of videos written.
+    """
+    output_path = Path(output_path)
+    if output_path.suffix.lower() in VIDEO_EXTENSIONS:
+        raise ValueError(f"Refusing to write the catalog over a video: {output_path}")
+    fields = list(CATALOG_FIELDS)
+    if transcriber is not None:
+        fields += ["suggested_description", "transcript"]
+
+    rows = []
+    total = len(video_files)
+    for number, file_path in enumerate(video_files, start=1):
+        print(f"[{number}/{total}] {file_path.name}")
+        try:
+            rows.append(
+                build_catalog_row(
+                    file_path.resolve(),
+                    base_dir,
+                    transcriber,
+                    debug,
+                    save_transcripts=save_transcripts,
+                )
+            )
+        except TranscriberUnavailable:
+            raise
+        except Exception as exc:  # pylint: disable=broad-exception-caught  # one bad file must not stop a run
+            print(f"Warning: Could not catalog {file_path.name}: {exc}")
+            if debug:
+                raise
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = output_path.with_name(f".{output_path.name}.{os.getpid()}.tmp")
+    # A byte-order mark lets Excel recognize the file as UTF-8 so accented
+    # place names and species names display correctly.
+    with temporary_path.open("w", newline="", encoding="utf-8-sig") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(rows)
+    temporary_path.replace(output_path)
+    return len(rows)
+
+
 # --- Interactive review mode ---
 
 
@@ -719,6 +1344,10 @@ _INTERACTIVE_HTML = r"""<!doctype html>
     .done { text-align:center; padding:80px 20px; } .done h2 { font-size:30px; }
     .attribution { color:var(--muted); font-size:12px; text-align:right; }
     .attribution a { color:var(--muted); }
+    .suggest { display:flex; flex-wrap:wrap; gap:10px; align-items:center; }
+    #use-suggestion { background:#1f3b2c; border-color:#3f7a57; color:#c9f2d9; }
+    #use-suggestion:hover { background:#285038; }
+    #transcript { color:var(--muted); font-size:14px; max-height:6.5em; overflow:auto; margin-top:8px; overflow-wrap:anywhere; }
     @media (max-width:650px) { main{padding:12px}.hint{width:100%;margin:4px 0 0} }
   </style>
 </head>
@@ -739,6 +1368,11 @@ _INTERACTIVE_HTML = r"""<!doctype html>
       <div class="row">
         <label class="label" for="description">Description</label>
         <input id="description" autocomplete="off" maxlength="160" placeholder="What happens in this video?">
+      </div>
+      <div class="row" id="suggestion-row" hidden>
+        <div class="label">Heard in this clip</div>
+        <div class="suggest"><button type="button" id="use-suggestion" hidden></button><span class="hint" id="suggestion-hint" hidden>Tab uses the suggestion</span></div>
+        <div id="transcript"></div>
       </div>
       <div class="row"><div class="label">Proposed name</div><div class="filename" id="proposed"></div></div>
       <div class="actions">
@@ -764,6 +1398,8 @@ const $ = id => document.getElementById(id);
 let items = [], position = 0, busy = false, scanComplete = false, dryRun = false;
 const knownItemIds = new Set();
 let scanned = 0, total = 0, itemOffset = 0, stopped = false, pollTimer = null, locationTimer = null;
+let transcriptsEnabled = false, transcriptTimer = null;
+const defaultPlaceholder = 'What happens in this video?';
 function cleanDescription(value) {
   return value.trim().replace(/[<>:"/\\|?*\x00-\x1f]/g, ' ')
     .replace(/[\s_]+/g, '_').replace(/^[ ._-]+|[ ._-]+$/g, '');
@@ -822,6 +1458,43 @@ function scheduleLocationLookup(item) {
     if (position < items.length && items[position].id === item.id) ensureLocation(item);
   }, 750);
 }
+// Transcripts are produced in the background; the reviewer polls only for the
+// video on screen and never fills the description in without being asked.
+function showTranscript(item) {
+  clearTimeout(transcriptTimer);
+  const info = item.transcriptInfo;
+  $('suggestion-row').hidden = !transcriptsEnabled;
+  $('use-suggestion').hidden = true; $('suggestion-hint').hidden = true;
+  $('description').placeholder = defaultPlaceholder;
+  if (!transcriptsEnabled) return;
+  if (!info) { $('transcript').textContent = 'Listening to this clip…'; loadTranscript(item); return; }
+  if (info.status !== 'ready') { $('transcript').textContent = 'No transcript is available for this clip.'; return; }
+  $('transcript').textContent = info.transcript || 'No speech detected.';
+  if (info.suggestion) {
+    $('use-suggestion').textContent = `Use “${info.suggestion}”`;
+    $('use-suggestion').hidden = false; $('suggestion-hint').hidden = false;
+    $('description').placeholder = info.suggestion;
+  }
+}
+async function loadTranscript(item) {
+  try {
+    const response = await fetch(`/api/transcript/${item.id}`);
+    const result = await response.json();
+    if (response.ok && result.status !== 'pending') item.transcriptInfo = result;
+  } catch (_) { /* retried below while the video stays on screen */ }
+  if (position < items.length && items[position].id === item.id) {
+    if (item.transcriptInfo) showTranscript(item);
+    else transcriptTimer = setTimeout(() => loadTranscript(item), 1500);
+  }
+}
+function useSuggestion() {
+  if (position >= items.length) return false;
+  const info = items[position].transcriptInfo;
+  if (!info || !info.suggestion) return false;
+  const input = $('description'); input.value = info.suggestion; input.focus();
+  input.dispatchEvent(new Event('input'));
+  return true;
+}
 function render() {
   if (position >= items.length) { waitForItem(); return; }
   const item = items[position];
@@ -833,6 +1506,7 @@ function render() {
   $('previous').disabled = position === 0; $('message').textContent = '';
   const video = $('video'); video.pause(); video.src = `/video/${item.id}/browser`; video.load();
   scheduleLocationLookup(item);
+  showTranscript(item);
   $('description').focus(); $('description').select();
 }
 function updateProgress() {
@@ -892,7 +1566,7 @@ async function deleteCurrent() {
   const item = items[position];
   const prompt = dryRun
     ? `Remove “${item.current_name}” from this review?\n\nDry-run mode will not delete the file.`
-    : `Permanently delete “${item.current_name}”?\n\nThis cannot be undone.`;
+    : `Move “${item.current_name}” to the Trash?\n\nYou can restore it from the Trash later.`;
   if (!window.confirm(prompt)) return;
   setBusy(true); $('message').textContent = '';
   const video = $('video'); video.pause(); video.removeAttribute('src'); video.load();
@@ -919,6 +1593,7 @@ async function refreshItems() {
     });
     itemOffset = data.next_offset;
     scanComplete = data.scan_complete; scanned = data.scanned; total = data.total; dryRun = data.dry_run;
+    transcriptsEnabled = Boolean(data.transcripts);
     if ($('workspace').hidden && position < items.length) render();
     else if (position >= items.length && scanComplete) finish();
     else if ($('workspace').hidden) waitForItem();
@@ -935,6 +1610,12 @@ $('description').addEventListener('input', () => {
   if (!item.locationAttempted) ensureLocation(item);
   $('proposed').textContent = proposedName(item, $('description').value);
 });
+$('description').addEventListener('keydown', event => {
+  if (event.key === 'Tab' && !event.shiftKey && !$('description').value.trim() && useSuggestion()) {
+    event.preventDefault();
+  }
+});
+$('use-suggestion').addEventListener('click', useSuggestion);
 $('save').addEventListener('click', renameCurrent);
 $('delete').addEventListener('click', deleteCurrent);
 $('skip').addEventListener('click', next);
@@ -995,6 +1676,7 @@ def _review_items_response(server, since):
             "total": server.scan_total,
             "scan_complete": server.scan_complete,
             "dry_run": server.dry_run,
+            "transcripts": getattr(server, "transcriber", None) is not None,
         }
 
 
@@ -1248,7 +1930,7 @@ def _stop_preview_conversions(server):
 
 
 def _delete_review_item(server, item):
-    """Delete one reviewed video, or only remove it from a dry-run session."""
+    """Move one reviewed video to the Trash, or only drop it from a dry run."""
     with server.preview_locks_lock:
         item_lock = server.preview_locks.setdefault(item["id"], threading.Lock())
 
@@ -1258,9 +1940,12 @@ def _delete_review_item(server, item):
         source_path = item["path"]
         if not server.dry_run:
             try:
-                source_path.unlink()
+                move_to_trash(source_path)
             except FileNotFoundError as exc:
                 raise ValueError(f"Video no longer exists: {source_path.name}") from exc
+            except OSError as exc:
+                raise ValueError(str(exc)) from exc
+            _remove_transcript_file(source_path)
         item["deleted"] = True
 
         preview_path = item.pop("browser_preview_path", None)
@@ -1358,6 +2043,14 @@ class _ReviewRequestHandler(BaseHTTPRequestHandler):
                 self.send_error(400, "Invalid item offset")
                 return
             self._send_json(_review_items_response(self.server, since))
+            return
+        match = re.fullmatch(r"/api/transcript/(\d+)", route)
+        if match:
+            item = self._item(match.group(1))
+            if item:
+                self._send_json(_transcript_response(self.server, item))
+            else:
+                self.send_error(404)
             return
         match = re.fullmatch(r"/video/(\d+)(/browser)?", route)
         if match:
@@ -1505,6 +2198,7 @@ class _ReviewRequestHandler(BaseHTTPRequestHandler):
             if changed and not self.server.dry_run:
                 old_path.rename(new_path)
                 item["path"] = new_path
+                _move_transcript_file(old_path, new_path)
             item["description"] = description.strip()
         prefix = "[DRY]" if self.server.dry_run else "[RENAME]"
         print(f"{prefix} {old_path.name} → {new_path.name}")
@@ -1526,6 +2220,83 @@ class _ReviewRequestHandler(BaseHTTPRequestHandler):
                 raise ValueError("No system video opener was found.")
             command = [opener, str(path)]
         subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def _transcript_response(server, item):
+    """Return the transcript status of a review item for the browser."""
+    if getattr(server, "transcriber", None) is None:
+        return {"status": "disabled"}
+    with server.review_lock:
+        server.transcript_priority = item["id"]
+        entry = server.transcripts.get(item["id"])
+        failed = getattr(server, "transcription_failed", False)
+    if entry is None:
+        return {"status": "unavailable" if failed else "pending"}
+    return dict(entry)
+
+
+def _next_transcript_item(server):
+    """Pick the next review item to transcribe, preferring the one on screen."""
+    with server.review_lock:
+        priority = getattr(server, "transcript_priority", None)
+        candidates = [
+            item
+            for item in server.review_items
+            if not item.get("deleted") and item["id"] not in server.transcripts
+        ]
+        for item in candidates:
+            if item["id"] == priority:
+                return item, item["path"]
+        # Otherwise work ahead of the reviewer, starting just after the
+        # video on screen so upcoming suggestions are ready in time.
+        if priority is not None:
+            for item in candidates:
+                if item["id"] > priority:
+                    return item, item["path"]
+        if candidates:
+            return candidates[0], candidates[0]["path"]
+        return None, None
+
+
+def _transcribe_review_items(server):
+    """Transcribe review items in the background while the reviewer works."""
+    while not server.stop_event.is_set():
+        item, path = _next_transcript_item(server)
+        if item is None:
+            with server.review_lock:
+                scanning = not server.scan_complete
+            if not scanning:
+                return
+            server.stop_event.wait(0.5)
+            continue
+        try:
+            transcript = server.transcriber.transcript(path)
+        except TranscriberUnavailable as exc:
+            print(f"Warning: Transcription stopped: {exc}")
+            with server.review_lock:
+                server.transcription_failed = True
+            return
+        if transcript is None:
+            entry = {"status": "unavailable"}
+        else:
+            entry = {
+                "status": "ready",
+                "transcript": transcript,
+                "suggestion": suggest_description(transcript),
+            }
+        with server.review_lock:
+            server.transcripts[item["id"]] = entry
+            # Read the path again here: the video may have been renamed
+            # while it was being transcribed.
+            if (
+                transcript
+                and getattr(server, "save_transcripts", False)
+                and not server.dry_run
+                and not item.get("deleted")
+            ):
+                save_transcript_file(
+                    item["path"], transcript, server.transcriber.model_name
+                )
 
 
 def _scan_review_items(server, video_files, include_described, debug):
@@ -1557,7 +2328,14 @@ def _scan_review_items(server, video_files, include_described, debug):
         server.scan_complete = True
 
 
-def run_interactive(video_files, include_described=False, dry_run=False, debug=False):
+def run_interactive(
+    video_files,
+    include_described=False,
+    dry_run=False,
+    debug=False,
+    transcriber=None,
+    save_transcripts=False,
+):
     """Open the reviewer immediately and prepare video metadata in the background."""
     preview_directory = tempfile.TemporaryDirectory(prefix="video-rename-preview-")
     server = _ThreadingHTTPServer(("127.0.0.1", 0), _ReviewRequestHandler)
@@ -1574,6 +2352,11 @@ def run_interactive(video_files, include_described=False, dry_run=False, debug=F
     server.preview_locks_lock = threading.Lock()
     server.preview_processes = set()
     server.generated_previews = set()
+    server.transcriber = transcriber
+    server.transcripts = {}
+    server.transcript_priority = None
+    server.transcription_failed = False
+    server.save_transcripts = save_transcripts
     scanner = threading.Thread(
         target=_scan_review_items,
         args=(server, video_files, include_described, debug),
@@ -1581,6 +2364,13 @@ def run_interactive(video_files, include_described=False, dry_run=False, debug=F
         daemon=True,
     )
     scanner.start()
+    if transcriber is not None:
+        threading.Thread(
+            target=_transcribe_review_items,
+            args=(server,),
+            name="video-transcriber",
+            daemon=True,
+        ).start()
     url = f"http://127.0.0.1:{server.server_port}/"
     print(f"Scanning {len(video_files)} video(s) in the background at {url}")
     print("Use the Finish button or press Ctrl-C here when done.")
@@ -1650,6 +2440,7 @@ def process_file(file_path, dry_run, debug, is_recursive, base_dir):
     else:
         try:
             shutil.move(file_path, new_path)
+            _move_transcript_file(file_path, new_path)
             print(f"[RENAME] {display_name} → {new_path.name}")
         except OSError as e:
             print(f"Error: Failed to rename {file_path.name}. Reason: {e}")
@@ -1661,7 +2452,7 @@ def main():
     if len(sys.argv) == 1:
         print(
             "Usage: video_rename.py [PATH ...] [--recursive] [--interactive] "
-            "[--dry-run] [--debug]"
+            "[--catalog CSV_FILE] [--transcribe] [--dry-run] [--debug]"
         )
         print(
             "\nRenames video files based on GPS location and video orientation from EXIF data."
@@ -1669,6 +2460,12 @@ def main():
         print("\nExamples:")
         print("  video_rename.py /path/to/videos --interactive")
         print("  video_rename.py /path/to/videos --recursive")
+        print("  video_rename.py /path/to/videos --recursive --catalog clips.csv")
+        print("  video_rename.py /path/to/videos --interactive --transcribe")
+        print(
+            "  video_rename.py /path/to/videos --interactive --transcribe "
+            "--save-transcripts"
+        )
         print("  video_rename.py my_video.mp4 --dry-run")
         print("  video_rename.py my_video.mp4 --debug")
         print("  video_rename.py vid1.mov vid2.mp4 /path/to/more_vids")
@@ -1684,6 +2481,15 @@ Examples:
 
   # Review videos in a browser and add descriptions to their names
   video_rename.py /path/to/videos --interactive
+
+  # Same, with descriptions suggested from what is said in each video
+  video_rename.py /path/to/videos --interactive --transcribe
+
+  # Also keep each transcript in a searchable text file beside its video
+  video_rename.py /path/to/videos --interactive --transcribe --save-transcripts
+
+  # List every video in a spreadsheet without renaming anything
+  video_rename.py /path/to/videos --recursive --catalog clips.csv
 
   # See what changes would be made without actually renaming anything
   video_rename.py /path/to/videos --dry-run
@@ -1721,6 +2527,40 @@ Examples:
         help="In interactive mode, also review videos that appear to have descriptions.",
     )
     parser.add_argument(
+        "--catalog",
+        metavar="CSV_FILE",
+        help="Write a spreadsheet (CSV) listing every video's description, date,\n"
+        "location, orientation, duration and size. No files are renamed.",
+    )
+    parser.add_argument(
+        "--transcribe",
+        action="store_true",
+        help="Transcribe what is said in each video on this computer (needs\n"
+        "faster-whisper or openai-whisper, and FFmpeg). Interactive mode then\n"
+        "suggests a description; --catalog adds transcript columns.",
+    )
+    parser.add_argument(
+        "--save-transcripts",
+        action="store_true",
+        help="With --transcribe, also save each transcript as a text file next\n"
+        "to its video (same name, .txt), so it can be searched with tools\n"
+        "such as Spotlight. The text file is renamed along with the video.",
+    )
+    parser.add_argument(
+        "--whisper-model",
+        default=DEFAULT_WHISPER_MODEL,
+        metavar="NAME",
+        help=f"Whisper model for --transcribe (default: {DEFAULT_WHISPER_MODEL}).\n"
+        "Larger models such as 'small' are more accurate but slower.",
+    )
+    parser.add_argument(
+        "--vocabulary",
+        metavar="TEXT_FILE",
+        help="With --transcribe, a text file of names and terms (one per line)\n"
+        "that are often said in your videos, such as species or people's\n"
+        "names. Whisper is guided to spell them the same way.",
+    )
+    parser.add_argument(
         "--debug",
         action="store_true",
         help="Enable debug printing for orientation detection.",
@@ -1730,6 +2570,14 @@ Examples:
 
     if args.include_described and not args.interactive:
         parser.error("--include-described can only be used with --interactive")
+    if args.catalog and args.interactive:
+        parser.error("--catalog cannot be combined with --interactive")
+    if args.transcribe and not (args.interactive or args.catalog):
+        parser.error("--transcribe can only be used with --interactive or --catalog")
+    if args.save_transcripts and not args.transcribe:
+        parser.error("--save-transcripts can only be used with --transcribe")
+    if args.vocabulary and not args.transcribe:
+        parser.error("--vocabulary can only be used with --transcribe")
 
     if not EXIFTOOL_PATH:
         print("Error: 'exiftool' is not installed or not in your system's PATH.")
@@ -1748,12 +2596,62 @@ Examples:
         print("No video files found to process.")
         return
 
+    transcriber = None
+    if args.transcribe:
+        if not FFMPEG_PATH:
+            print("Error: --transcribe needs FFmpeg, which is not installed.")
+            sys.exit(1)
+        prompt = None
+        if args.vocabulary:
+            try:
+                terms = load_vocabulary(args.vocabulary)
+            except (OSError, UnicodeDecodeError) as exc:
+                print(f"Error: Could not read the word list {args.vocabulary}: {exc}")
+                sys.exit(1)
+            prompt = vocabulary_prompt(terms)
+            print(f"Using {len(terms)} terms from {Path(args.vocabulary).name}.")
+            if prompt and len(prompt) > VOCABULARY_PROMPT_WARN_CHARS:
+                print(
+                    "Warning: The word list is long; Whisper only reads about the "
+                    "last 200 words of it. Keep the most important terms near the end."
+                )
+        transcriber = Transcriber(args.whisper_model, prompt=prompt)
+        try:
+            print(f"Loading the '{args.whisper_model}' speech model...")
+            transcriber._ensure_backend()  # pylint: disable=protected-access
+        except TranscriberUnavailable as exc:
+            print(f"Error: {exc}")
+            sys.exit(1)
+
+    sorted_files = sorted(video_files, key=lambda path: str(path).lower())
+
+    if args.catalog:
+        catalog_base = None
+        if len(args.paths) == 1 and Path(args.paths[0]).is_dir():
+            catalog_base = Path(args.paths[0]).resolve()
+        try:
+            count = write_catalog(
+                sorted_files,
+                args.catalog,
+                catalog_base,
+                transcriber,
+                args.debug,
+                save_transcripts=args.save_transcripts,
+            )
+        except (TranscriberUnavailable, ValueError, OSError) as exc:
+            print(f"Error: {exc}")
+            sys.exit(1)
+        print(f"Wrote {count} video(s) to {args.catalog}")
+        return
+
     if args.interactive:
         run_interactive(
-            sorted(video_files, key=lambda path: str(path).lower()),
+            sorted_files,
             include_described=args.include_described,
             dry_run=args.dry_run,
             debug=args.debug,
+            transcriber=transcriber,
+            save_transcripts=args.save_transcripts,
         )
         return
 
