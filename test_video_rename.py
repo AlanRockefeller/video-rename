@@ -2637,8 +2637,7 @@ class TestSpeciesCorrectionOnRealNarration:
     """Cases from real field narration and ordinary English, with the included list."""
 
     @pytest.fixture(scope="class")
-    @classmethod
-    def species(cls):
+    def species(self):
         return video_rename.load_species_list(video_rename.DEFAULT_SPECIES_LIST)
 
     @pytest.mark.parametrize(
