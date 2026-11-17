@@ -31,6 +31,13 @@ commit date rather than release tag; the `v1.2` tag covers the 2026-10-24 and
 - Added `--vocabulary TEXT_FILE`, a list of names and terms (one per line)
   given to Whisper as a prompt so species and people's names are spelled
   consistently. Transcripts are cached separately for each word list.
+- Scientific names in transcripts are corrected against a list of real names,
+  so "Mycena hematopis" becomes *Mycena haematopus*. Names are compared by
+  sound, the list can hold many thousands of names, and listed names come
+  first in the suggested description whatever their ending. The included
+  `species_names.txt` holds about 8,900 species and genera observed on
+  iNaturalist by alan_rockefeller and mandiequark; `--species-list TEXT_FILE`
+  uses another list and `--species-list none` turns the correction off.
 - The transcript in the review screen is editable. A correction updates the
   suggested description, is remembered in the transcript cache (a cleared
   transcript stays cleared), and with `--save-transcripts` is saved to the
