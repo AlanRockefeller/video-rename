@@ -912,7 +912,8 @@ SPECIES_MIN_SCORE = 0.82
 # with the same letter and is long enough not to be an everyday word.
 _LONE_GENUS_MIN_LETTERS = 6
 # A heard genus that only nearly matches must have at least this many sounds,
-# and so must its species when that only nearly matches too.
+# and so must its species when that only nearly matches too.  A shorter genus
+# must sound identical, and so must its species.
 _NEAR_MISS_MIN_KEY = 5
 # How many of the genera sharing the most letter groups with a heard word are
 # compared with it in full.
@@ -1082,13 +1083,14 @@ class SpeciesList:
                 continue
             if genus_length == 1 and heard_genus.lower() in _SUGGESTION_STOPWORDS:
                 continue
-            if len(heard_genus) < (4 if genus_length == 1 else 6):
+            if len(heard_genus) < (3 if genus_length == 1 else 6):
                 continue
             for genus_score, genus in self._match_genus(heard_genus):
                 # A short word is too easily a near miss for some genus
                 # ("shall" for "Zale").
                 near_genus = genus_score < 0.99
-                if near_genus and len(_sound_key(heard_genus)) < _NEAR_MISS_MIN_KEY:
+                short_genus = len(_sound_key(heard_genus)) < _NEAR_MISS_MIN_KEY
+                if near_genus and short_genus:
                     continue
                 for epithet_length in (1, 2):
                     used = genus_length + epithet_length
@@ -1103,10 +1105,15 @@ class SpeciesList:
                     match = self._match_epithet(genus, heard_epithet)
                     if match is None:
                         continue
-                    if (
-                        near_genus
-                        and match[0] < 0.99
-                        and len(_sound_key(heard_epithet)) < _NEAR_MISS_MIN_KEY
+                    # After a short genus ("sea" sounds like "Zea") the
+                    # species must sound identical; after a near miss it
+                    # must at least be long.
+                    if match[0] < 0.99 and (
+                        short_genus
+                        or (
+                            near_genus
+                            and len(_sound_key(heard_epithet)) < _NEAR_MISS_MIN_KEY
+                        )
                     ):
                         continue
                     score = (genus_score + match[0]) / 2

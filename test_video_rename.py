@@ -2510,6 +2510,15 @@ class TestSpeciesNameCorrection:
         assert species.correct("A micena on the moss.") == "A Mycena on the moss."
         assert species.correct("Some Mycenas here.") == "Some Mycenas here."
 
+    def test_three_letter_genera_are_matched(self):
+        species = video_rename.SpeciesList(["Zea mays", "Bos taurus"])
+
+        assert species.correct("zea mais in the field") == "Zea mays in the field"
+        assert species.correct("a bos taurus calf") == "a Bos taurus calf"
+        # After so short a genus, the species must sound identical.
+        assert species.correct("the sea maze was fun") == "the sea maze was fun"
+        assert species.correct("the boss tours us") == "the boss tours us"
+
     def test_names_in_finds_listed_names_in_order(self):
         text = "Russula brevipes beside amanita muscaria, and Russula densifolia."
 
