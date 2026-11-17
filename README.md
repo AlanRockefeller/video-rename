@@ -146,6 +146,24 @@ characters or 40–50 scientific names, so keep the list short and put the most
 important terms at the end. The program warns when a list is longer. Changing the list gives
 fresh transcripts rather than reusing cached ones.
 
+Scientific names are also corrected after transcription, with no limit on how
+many names are known. Whisper spells unfamiliar Latin names by ear, so
+"Mycena hematopis", "my Sina hematopus" or "Lady Porous Gilbert Sony" come out
+as *Mycena haematopus* and *Laetiporus gilbertsonii* when those names are in
+the list. Both words of a name must sound like a listed name; a genus said on
+its own is only respelled when it sounds identical but is spelled differently
+("rusula" becomes *Russula*, while "a fuchsia color" is left as it is), so
+ordinary speech and people's names are left alone. A real genus is swapped for
+another only when the two sound nearly the same and the species belongs to the
+other one ("Panellus cinctulus" becomes *Panaeolus cinctulus*). The list that comes with the program, `species_names.txt`, holds the
+roughly 8,900 species and genera observed on iNaturalist by alan_rockefeller
+and mandiequark. Add names to it, or use `--species-list names.txt` for your
+own file: one name per line (`Genus` or `Genus species`), with blank lines and
+`#` comments ignored, or a spreadsheet export with the name in the first
+column. `--species-list none` turns the correction off. The transcript cache
+keeps what Whisper heard, so a longer list improves old transcripts without
+transcribing again, and a transcript you corrected by hand is never changed.
+
 Location lookup uses OpenStreetMap's Nominatim service conservatively: requests
 are serialized and limited to at most one every 1.1 seconds, nearby coordinates
 share a cache entry, and successful/no-result lookups are persisted at
@@ -220,6 +238,7 @@ python3 video_rename.py [PATHS...] [OPTIONS]
 -   `--save-transcripts`: With `--transcribe`, also save each transcript as a searchable text file beside its video (`IMG_1.mp4` → `IMG_1.mp4.txt`).
 -   `--whisper-model NAME`: Whisper model for `--transcribe` (default `base`; `small` is more accurate but slower).
 -   `--vocabulary TEXT_FILE`: With `--transcribe`, a list of names and terms (one per line) that Whisper should spell correctly.
+-   `--species-list TEXT_FILE`: With `--transcribe`, scientific names (one per line) used to correct names Whisper spelled by ear. Defaults to the included `species_names.txt`; `none` turns it off.
 -   `--debug`: Enable debug printing, which shows detailed metadata (width, height, rotation) for each file processed.
 
 ## Examples

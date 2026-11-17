@@ -6,6 +6,7 @@
 
 import argparse
 import csv
+import difflib
 import hashlib
 import json
 import mimetypes
@@ -721,8 +722,7 @@ SUGGESTION_MAX_WORDS = 6
 _FINGERPRINT_BYTES = 1024 * 1024
 
 # Words that carry little meaning in a filename.  Kept lowercase.
-_SUGGESTION_STOPWORDS = frozenset(
-    """
+_SUGGESTION_STOPWORDS = frozenset("""
     a about above actually after again against all almost also always am an and
     another any anything are around as at away back be because been before being
     below between both but by can come comes coming could did do does doing done
@@ -735,8 +735,7 @@ _SUGGESTION_STOPWORDS = frozenset(
     than that the their them then there these they thing things think this those
     through to today too up us very want was way we well were what when where which
     while who why will with would wow yeah yes yet you your
-    """.split()  # noqa: SIM905 - easier to read and edit as prose
-)
+    """.split())  # noqa: SIM905 - easier to read and edit as prose
 # A capitalized word followed by a lowercase word with a typical Latin
 # species ending, such as "Amanita muscaria" or "Ophiocordyceps australis".
 _SPECIES_NAME_RE = re.compile(
@@ -745,13 +744,11 @@ _SPECIES_NAME_RE = re.compile(
 )
 # Everyday words that happen to end like a Latin epithet, so that phrases such
 # as "Bioluminescent fungi" or "Giant fungus" are not taken for species names.
-_NOT_EPITHETS = frozenset(
-    """
+_NOT_EPITHETS = frozenset("""
     area banana bonus cactus camera campus chorus data delta extra focus fungi
     fungus genus idea media mycelia octopus opus pasta pizza plus sofa status taxi
     tuna ultra virus
-    """.split()  # noqa: SIM905 - easier to read and edit as prose
-)
+    """.split())  # noqa: SIM905 - easier to read and edit as prose
 _TRANSCRIPT_WORD_RE = re.compile(r"[A-Za-z][A-Za-z'-]*[A-Za-z]")
 # At the start of a sentence every word is capitalized, so "Strong flavor" or
 # "Gorgeous patina" would look like species.  There, a pair only counts when
@@ -774,13 +771,14 @@ def _capitalized_mid_sentence(text, word):
     )
 
 
-def suggest_description(transcript, max_words=SUGGESTION_MAX_WORDS):
+def suggest_description(transcript, max_words=SUGGESTION_MAX_WORDS, species=None):
     """Suggest a short filename description from what is said in a clip.
 
     Species names (a capitalized genus and a Latin-looking epithet) come first
     because narrators usually name what they are filming; the most frequent
     remaining meaningful words fill the rest, in the order they were spoken.
-    Returns an empty string when nothing useful was said.
+    Names found in ``species`` (a SpeciesList) are recognized whatever their
+    ending.  Returns an empty string when nothing useful was said.
     """
     if not transcript:
         return ""
@@ -795,6 +793,13 @@ def suggest_description(transcript, max_words=SUGGESTION_MAX_WORDS):
         seen.add(key)
         chosen.append(word)
         return True
+
+    for genus, epithet in species.names_in(transcript) if species else ():
+        if len(chosen) + 2 > max_words:
+            break
+        if genus.lower() not in seen:
+            add(genus)
+            add(epithet)
 
     for match in _SPECIES_NAME_RE.finditer(transcript):
         genus, epithet = match.groups()
@@ -893,6 +898,385 @@ def vocabulary_prompt(terms):
     return "Glossary: " + ", ".join(terms) + "."
 
 
+# --- Scientific name correction ---
+
+# Whisper spells unfamiliar Latin names by ear ("Mycena hematopis").  After
+# transcription, word pairs are compared by sound with a list of real names.
+# Unlike the --vocabulary prompt, the list can hold many thousands of names.
+_NAME_TOKEN_RE = re.compile(r"[A-Za-z]+(?:-[A-Za-z]+)*")
+# How alike (0 to 1) a heard word and a listed one must sound.  Each half of a
+# name must reach the first figure and the two halves must average the second.
+SPECIES_MIN_PART_SCORE = 0.72
+SPECIES_MIN_SCORE = 0.82
+# A genus said on its own is only respelled when it sounds identical, starts
+# with the same letter and is long enough not to be an everyday word.  A
+# capitalized word in mid-sentence is often a person's name, so it must be
+# longer still.
+_LONE_GENUS_MIN_LETTERS = 6
+_LONE_CAPITALIZED_GENUS_MIN_LETTERS = 7
+# A heard word that is itself a listed genus is respelled as another genus
+# only when the two sound at least this alike ("Panellus" for "Panaeolus").
+_RESPELL_REAL_GENUS_SCORE = 0.9
+# When a name could also start one word later ("the Hovella lacunosa"), the
+# reading that keeps the extra word wins unless joining it scores this much
+# better.
+_JOIN_MARGIN = 0.05
+# A heard genus that only nearly matches must have at least this many sounds,
+# and so must its species when that only nearly matches too.  A shorter genus
+# must sound identical, and so must its species.
+_NEAR_MISS_MIN_KEY = 5
+# How many of the genera sharing the most letter groups with a heard word are
+# compared with it in full.
+_GENUS_CANDIDATES = 40
+_NOT_EPITHET_WORDS = frozenset({"spp", "aff", "var", "sect", "subsp"})
+# The name list that comes with this program, used unless another is given.
+DEFAULT_SPECIES_LIST = Path(__file__).resolve().with_name("species_names.txt")
+_EDITED_KEY_SUFFIX = "#edited"
+
+
+def _sound_key(word):
+    """Reduce a word to roughly how it sounds, so spellings by ear compare equal.
+
+    "haematopus" and "hematopus", or "Psathyrella" and "Sathyrella", give the
+    same key.
+    """
+    key = word.lower().replace("-", "")
+    key = re.sub(r"^(?:ps|pt|pn|gn|kn|mn)", lambda match: match.group()[1], key)
+    key = re.sub(r"^x", "z", key)
+    for old, new in (
+        ("ae", "e"),
+        ("oe", "e"),
+        ("ph", "f"),
+        ("ch", "k"),
+        ("ck", "k"),
+        ("qu", "kw"),
+        ("x", "ks"),
+        ("y", "i"),
+        ("z", "s"),
+    ):
+        key = key.replace(old, new)
+    key = re.sub(r"c(?=[ei])", "s", key).replace("c", "k")
+    key = key.replace("h", "")
+    return re.sub(r"(.)\1+", r"\1", key)
+
+
+def _is_acronym(word):
+    """Return True for a word written in capitals, such as "ALIASES"."""
+    return len(word) > 1 and word.isupper()
+
+
+def _similarity(first, second):
+    """Return how alike two sound keys are, from 0 to 1."""
+    return difflib.SequenceMatcher(None, first, second).ratio()
+
+
+def _trigrams(key):
+    padded = f"^{key}$"
+    return {padded[index : index + 3] for index in range(len(padded) - 2)}
+
+
+class SpeciesList:
+    """Scientific names used to correct how Whisper spelled them.
+
+    Each name is a genus, optionally followed by a species epithet
+    ("Mycena haematopus").  Anything after the first two words, such as an
+    author or variety, is ignored.
+    """
+
+    def __init__(self, names=()):
+        self.count = 0
+        self._genera = {}  # "mycena" -> "Mycena"
+        self._epithets = {}  # "mycena" -> {"haematopus": sound key}
+        self._genus_keys = {}  # "mycena" -> sound key
+        self._genera_by_key = {}  # sound key -> ["mycena"]
+        self._genera_by_trigram = {}
+        self._genus_matches = {}
+        self._epithet_matches = {}
+        for name in names:
+            self._add(name)
+
+    def _add(self, name):
+        words = _NAME_TOKEN_RE.findall(name)
+        if not words or len(words[0]) < 3:
+            return
+        genus = words[0].lower()
+        if genus not in self._genera:
+            self._genera[genus] = genus.capitalize()
+            self._epithets[genus] = {}
+            key = self._genus_keys[genus] = _sound_key(genus)
+            self._genera_by_key.setdefault(key, []).append(genus)
+            for trigram in _trigrams(key):
+                self._genera_by_trigram.setdefault(trigram, set()).add(genus)
+            self.count += 1
+        if len(words) < 2 or not words[1][0].islower():
+            return
+        epithet = words[1].lower()
+        if len(epithet) < 3 or epithet in _NOT_EPITHET_WORDS:
+            return
+        if not self._epithets[genus]:
+            # The first species replaces the count made for its bare genus.
+            self.count -= 1
+        if epithet not in self._epithets[genus]:
+            self._epithets[genus][epithet] = _sound_key(epithet)
+            self.count += 1
+
+    def _match_genus(self, word):
+        """Return [(score, genus)] for the listed genera that sound like word."""
+        folded = word.lower()
+        if folded in self._genus_matches:
+            return self._genus_matches[folded]
+        key = _sound_key(folded)
+        if folded in self._genera:
+            # A real genus may still be a mishearing of a similar one
+            # ("Panellus cinctulus" for "Panaeolus cinctulus"), so near
+            # matches are kept too; the exact one scores highest.
+            matches = [(1.0, folded)]
+        else:
+            matches = [(0.99, genus) for genus in self._genera_by_key.get(key, ())]
+        if not matches or matches[0][0] == 1.0:
+            shared = {}
+            for trigram in _trigrams(key):
+                for genus in self._genera_by_trigram.get(trigram, ()):
+                    shared[genus] = shared.get(genus, 0) + 1
+            closest = sorted(shared, key=lambda genus: (-shared[genus], genus))
+            for genus in closest[:_GENUS_CANDIDATES]:
+                if genus == folded:
+                    continue
+                score = min(_similarity(key, self._genus_keys[genus]), 0.98)
+                if score >= SPECIES_MIN_PART_SCORE:
+                    matches.append((score, genus))
+        self._genus_matches[folded] = matches
+        return matches
+
+    def _is_genus(self, word):
+        """Return True if word is, or sounds identical to, a listed genus."""
+        folded = word.lower()
+        return folded in self._genera or _sound_key(folded) in self._genera_by_key
+
+    def _match_epithet(self, genus, word):
+        """Return (score, epithet) for the genus's best-sounding species, or None."""
+        folded = word.lower()
+        cache_key = (genus, folded)
+        if cache_key in self._epithet_matches:
+            return self._epithet_matches[cache_key]
+        epithets = self._epithets[genus]
+        match = None
+        if folded in epithets:
+            match = (1.0, folded)
+        elif len(folded) >= 4 and folded not in _SUGGESTION_STOPWORDS:
+            key = _sound_key(folded)
+            by_key = {}
+            for epithet, epithet_key in epithets.items():
+                by_key.setdefault(epithet_key, epithet)
+            close = difflib.get_close_matches(
+                key, list(by_key), n=1, cutoff=SPECIES_MIN_PART_SCORE
+            )
+            if close:
+                match = (min(_similarity(key, close[0]), 0.99), by_key[close[0]])
+        self._epithet_matches[cache_key] = match
+        return match
+
+    @staticmethod
+    def _joined(text, tokens, start, length, filler_allowed=None):
+        """Join words that have only spaces between them, or return None.
+
+        Whisper sometimes splits an unfamiliar name ("my Sina" for "Mycena").
+        Filler words glued together ("no other") are not a name, so when
+        ``filler_allowed`` is given, no more than that many of the joined
+        words may be everyday filler.  Filler may begin a split name but not
+        end one ("stack is" is not "Stachys"), and words in capitals are
+        never glued together.
+        """
+        if start + length > len(tokens):
+            return None
+        for index in range(start, start + length - 1):
+            if text[tokens[index].end() : tokens[index + 1].start()].strip():
+                return None
+        words = [token.group() for token in tokens[start : start + length]]
+        if filler_allowed is not None and length > 1:
+            filler = sum(word.lower() in _SUGGESTION_STOPWORDS for word in words)
+            if filler > filler_allowed:
+                return None
+            if words[-1].lower() in _SUGGESTION_STOPWORDS:
+                return None
+            if any(_is_acronym(word) for word in words):
+                return None
+        return "".join(words)
+
+    def _name_at(self, text, tokens, index):
+        """Return (correct name, words used, score) for a name at tokens[index]."""
+        best = None
+        for genus_length in (1, 2):
+            if self._joined(text, tokens, index, genus_length) is None:
+                break
+            heard_genus = self._joined(text, tokens, index, genus_length, 1)
+            if heard_genus is None:
+                continue
+            if genus_length == 2:
+                first, second = (token.group() for token in tokens[index : index + 2])
+                # "tricholoma and" or "we have Panellus" is a real genus next
+                # to an everyday word, not a name Whisper split in two.
+                if self._is_genus(first) or (
+                    self._is_genus(second) and first.lower() in _SUGGESTION_STOPWORDS
+                ):
+                    continue
+            if genus_length == 1 and heard_genus.lower() in _SUGGESTION_STOPWORDS:
+                continue
+            if len(heard_genus) < (3 if genus_length == 1 else 6):
+                continue
+            is_listed_genus = heard_genus.lower() in self._genera
+            if heard_genus.lower() in _NOT_EPITHETS and not is_listed_genus:
+                # Everyday words such as "status" are not misheard genera.
+                continue
+            for genus_score, genus in self._match_genus(heard_genus):
+                # A real genus is only swapped for one that sounds nearly the
+                # same: "Panellus" for "Panaeolus", not "Ophiocordyceps" for
+                # "Cordyceps".
+                if is_listed_genus and genus_score < _RESPELL_REAL_GENUS_SCORE:
+                    continue
+                # A short word is too easily a near miss for some genus
+                # ("shall" for "Zale").
+                near_genus = genus_score < 0.99
+                # A word in capitals is usually an acronym, so it must sound
+                # identical ("ALIASES" is not a misheard "Alces").
+                if near_genus and _is_acronym(heard_genus):
+                    continue
+                short_genus = len(_sound_key(heard_genus)) < _NEAR_MISS_MIN_KEY
+                if near_genus and short_genus:
+                    continue
+                for epithet_length in (1, 2):
+                    used = genus_length + epithet_length
+                    # The whole name must be spoken without punctuation.
+                    if self._joined(text, tokens, index, used) is None:
+                        break
+                    heard_epithet = self._joined(
+                        text, tokens, index + genus_length, epithet_length, 0
+                    )
+                    if heard_epithet is None:
+                        continue
+                    match = self._match_epithet(genus, heard_epithet)
+                    if match is None:
+                        continue
+                    near_epithet = match[0] < 0.99
+                    if near_epithet and _is_acronym(heard_epithet):
+                        continue
+                    # An everyday word ("status") only counts as a misheard
+                    # species after a genus heard exactly ("Tricholomopsis
+                    # area" for "aurea").
+                    if (
+                        match[0] < 1.0
+                        and near_genus
+                        and heard_epithet.lower() in _NOT_EPITHETS
+                    ):
+                        continue
+                    # The same word twice ("hashes hashes") is only a name
+                    # when it is spelled as one ("Alces alces").
+                    if heard_genus.lower() == heard_epithet.lower() and (
+                        genus_score < 1.0 or match[0] < 1.0
+                    ):
+                        continue
+                    # After a short genus ("sea" sounds like "Zea") the
+                    # species must sound identical; after a near miss it
+                    # must at least be long.
+                    if near_epithet and (
+                        short_genus
+                        or (
+                            near_genus
+                            and len(_sound_key(heard_epithet)) < _NEAR_MISS_MIN_KEY
+                        )
+                    ):
+                        continue
+                    score = (genus_score + match[0]) / 2
+                    if score < SPECIES_MIN_SCORE:
+                        continue
+                    candidate = (score, -used, f"{self._genera[genus]} {match[1]}")
+                    if best is None or candidate[:2] > best[:2]:
+                        best = candidate
+        if best is not None:
+            return best[2], -best[1], best[0]
+
+        word = tokens[index].group()
+        min_letters = _LONE_GENUS_MIN_LETTERS
+        if word[0].isupper() and not _starts_sentence(text, tokens[index].start()):
+            # "Andrea" is more likely a person than the moss "Andreaea".
+            min_letters = _LONE_CAPITALIZED_GENUS_MIN_LETTERS
+        # Odd capitals ("LarryX", "CALIPSO") mark a name or an acronym.
+        if len(word) >= min_letters and (word.islower() or word.istitle()):
+            matches = [match for match in self._match_genus(word) if match[0] >= 0.99]
+            if (
+                len(matches) == 1
+                and matches[0][1][0] == word[0].lower()
+                # Only capitalizing would turn "a fuchsia color" into
+                # "a Fuchsia color", so a word already spelled right is left.
+                and matches[0][1] != word.lower()
+                and abs(len(matches[0][1]) - len(word)) <= 1
+            ):
+                return self._genera[matches[0][1]], 1, 0.0
+        return None
+
+    def correct(self, text):
+        """Return text with misheard scientific names spelled as in the list."""
+        if not text or not self._genera:
+            return text
+        tokens = list(_NAME_TOKEN_RE.finditer(text))
+        pieces = []
+        position = index = 0
+        while index < len(tokens):
+            found = self._name_at(text, tokens, index)
+            if found is not None and found[1] > 1 and index + 1 < len(tokens):
+                # "is Mycena hematopis" can pass for a name split in two
+                # ("isMycena"); the name starting one word later fits better.
+                later = self._name_at(text, tokens, index + 1)
+                joined = found[1] > len(found[0].split())
+                margin = _JOIN_MARGIN if joined else 0
+                if later is not None and later[2] > found[2] - margin:
+                    found = None
+            if found is None:
+                index += 1
+                continue
+            name, used, _score = found
+            pieces.append(text[position : tokens[index].start()])
+            pieces.append(name)
+            position = tokens[index + used - 1].end()
+            index += used
+        pieces.append(text[position:])
+        return "".join(pieces)
+
+    def names_in(self, text):
+        """Return the (genus, epithet) pairs from the list that appear in text."""
+        tokens = list(_NAME_TOKEN_RE.finditer(text or ""))
+        found = []
+        for index in range(len(tokens) - 1):
+            genus = tokens[index].group().lower()
+            epithet = tokens[index + 1].group().lower()
+            if (
+                epithet in self._epithets.get(genus, ())
+                and self._joined(text, tokens, index, 2) is not None
+            ):
+                found.append((self._genera[genus], epithet))
+        return found
+
+
+def load_species_list(path):
+    """Read scientific names for correcting transcripts: one name per line.
+
+    Blank lines and lines starting with "#" are ignored.  In a spreadsheet
+    export (CSV or tab-separated), the name is read from the first column.
+    """
+    names = []
+    for line in Path(path).read_text(encoding="utf-8-sig").splitlines():
+        name = re.split(r"[,;\t]", line, maxsplit=1)[0].strip().strip("\"'")
+        if name and not name.startswith("#"):
+            names.append(name)
+    return SpeciesList(names)
+
+
+def _species_list(transcriber):
+    """Return the transcriber's SpeciesList, or None if it has none."""
+    species = getattr(transcriber, "species", None)
+    return species if isinstance(species, SpeciesList) else None
+
+
 def _load_speech_backend(model_name, prompt=None):
     """Return a callable that transcribes an audio file, or None.
 
@@ -939,11 +1323,22 @@ class Transcriber:
     computer; nothing is sent over the network.  Transcripts are cached by
     file content, model name and word list, so renamed files are not
     transcribed twice.
+
+    ``species`` (a SpeciesList) corrects scientific names in what was heard.
+    The cache keeps the text as heard, so a longer list improves old
+    transcripts without transcribing again; hand-corrected text is left alone.
     """
 
-    def __init__(self, model_name=DEFAULT_WHISPER_MODEL, backend=None, prompt=None):
+    def __init__(
+        self,
+        model_name=DEFAULT_WHISPER_MODEL,
+        backend=None,
+        prompt=None,
+        species=None,
+    ):
         self.model_name = model_name
         self.prompt = prompt or None
+        self.species = species
         self._backend = backend
         # _lock serializes transcription (one model run at a time); the
         # cache has its own lock so a reviewer's correction never waits for
@@ -1046,6 +1441,12 @@ class Transcriber:
         # A WAV header alone is 44 bytes; anything shorter holds no audio.
         return audio_path.exists() and audio_path.stat().st_size > 44
 
+    def _corrected(self, key, text):
+        """Fix scientific names in heard text; call with the cache lock held."""
+        if self.species is None or self._cache.get(key + _EDITED_KEY_SUFFIX):
+            return text
+        return self.species.correct(text)
+
     def transcript(self, file_path):
         """Return the transcript of a video's speech ("" when nothing is said).
 
@@ -1061,7 +1462,7 @@ class Transcriber:
             with self._cache_lock:
                 self._load_cache()
                 if key in self._cache:
-                    return self._cache[key]
+                    return self._corrected(key, self._cache[key])
             try:
                 backend = self._ensure_backend()
                 with tempfile.TemporaryDirectory(
@@ -1080,8 +1481,9 @@ class Transcriber:
             text = re.sub(r"\s+", " ", text or "").strip()
             with self._cache_lock:
                 self._cache[key] = text
+                self._cache.pop(key + _EDITED_KEY_SUFFIX, None)
                 self._save_cache()
-            return text
+                return self._corrected(key, text)
 
     def remember(self, file_path, text):
         """Store a reviewer's corrected transcript in place of the heard one.
@@ -1098,6 +1500,8 @@ class Transcriber:
         with self._cache_lock:
             self._load_cache()
             self._cache[key] = re.sub(r"\s+", " ", text or "").strip()
+            # Marked so that name correction never rewrites a hand correction.
+            self._cache[key + _EDITED_KEY_SUFFIX] = "1"
             self._save_cache()
         return True
 
@@ -1421,7 +1825,9 @@ def build_catalog_row(
         edited_text, edited = read_transcript_file(file_path)
         transcript = edited_text if edited else transcriber.transcript(file_path)
         row["transcript"] = transcript or ""
-        row["suggested_description"] = suggest_description(transcript)
+        row["suggested_description"] = suggest_description(
+            transcript, species=_species_list(transcriber)
+        )
         if save_transcripts and not edited:
             save_transcript_file(file_path, transcript, transcriber.model_name)
     if debug:
@@ -2561,12 +2967,12 @@ def _transcript_response(server, item):
     return dict(entry)
 
 
-def _transcript_entry(transcript, edited=False):
+def _transcript_entry(transcript, edited=False, species=None):
     """Build the browser's view of one clip's transcript."""
     return {
         "status": "ready",
         "transcript": transcript,
-        "suggestion": suggest_description(transcript),
+        "suggestion": suggest_description(transcript, species=species),
         "edited": edited,
         "word_count": _transcript_word_count(transcript),
         "min_words": MIN_TRANSCRIPT_WORDS,
@@ -2584,7 +2990,9 @@ def _save_edited_transcript(server, item, transcript):
     if getattr(server, "transcriber", None) is None:
         raise ValueError("Transcription is not turned on.")
     transcript = transcript.strip()
-    entry = _transcript_entry(transcript, edited=True)
+    entry = _transcript_entry(
+        transcript, edited=True, species=_species_list(server.transcriber)
+    )
     with server.rename_lock:
         with server.review_lock:
             if item.get("deleted") or item.get("deleting"):
@@ -2673,7 +3081,9 @@ def _transcribe_review_items(server):
                 continue
             entry = {"status": "unavailable"}
         else:
-            entry = _transcript_entry(transcript, edited)
+            entry = _transcript_entry(
+                transcript, edited, _species_list(server.transcriber)
+            )
         with server.review_lock:
             if item["id"] in server.transcripts:
                 # The reviewer already saved an edit for this clip.
@@ -2959,6 +3369,15 @@ Examples:
         "names. Whisper is guided to spell them the same way.",
     )
     parser.add_argument(
+        "--species-list",
+        metavar="TEXT_FILE",
+        help="With --transcribe, a text file of scientific names (one per line,\n"
+        "for example 'Mycena haematopus'). Names that Whisper spelled by ear\n"
+        "are corrected to match. The list can hold many thousands of names.\n"
+        "Default: the species_names.txt that comes with this program.\n"
+        "Use 'none' to turn name correction off.",
+    )
+    parser.add_argument(
         "--debug",
         action="store_true",
         help="Enable debug printing for orientation detection.",
@@ -2978,6 +3397,8 @@ Examples:
         parser.error("--save-transcripts can only be used with --transcribe")
     if args.vocabulary and not args.transcribe:
         parser.error("--vocabulary can only be used with --transcribe")
+    if args.species_list and not args.transcribe:
+        parser.error("--species-list can only be used with --transcribe")
 
     if not EXIFTOOL_PATH:
         print("Error: 'exiftool' is not installed or not in your system's PATH.")
@@ -3016,7 +3437,26 @@ Examples:
                     "last 600 characters of it. Keep the most important terms near "
                     "the end."
                 )
-        transcriber = Transcriber(args.whisper_model, prompt=prompt)
+        species = None
+        species_path = args.species_list
+        if species_path is None and DEFAULT_SPECIES_LIST.is_file():
+            species_path = DEFAULT_SPECIES_LIST
+        elif species_path is not None and species_path.lower() == "none":
+            species_path = None
+        if species_path:
+            try:
+                species = load_species_list(species_path)
+            except (OSError, UnicodeDecodeError) as exc:
+                print(f"Error: Could not read the name list {species_path}: {exc}")
+                sys.exit(1)
+            if not species.count:
+                print(f"Error: No scientific names were found in {species_path}.")
+                sys.exit(1)
+            print(
+                f"Correcting names against {species.count} scientific names "
+                f"from {Path(species_path).name}."
+            )
+        transcriber = Transcriber(args.whisper_model, prompt=prompt, species=species)
         try:
             print(f"Loading the '{args.whisper_model}' speech model...")
             transcriber._ensure_backend()  # pylint: disable=protected-access

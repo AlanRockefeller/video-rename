@@ -2431,3 +2431,271 @@ class TestVocabulary:
         assert model.transcribe.call_args.kwargs["initial_prompt"] == (
             "Glossary: Mycena."
         )
+
+
+class TestSpeciesNameCorrection:
+    @pytest.fixture(autouse=True)
+    def _isolated_cache(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+
+    @staticmethod
+    def _species():
+        return video_rename.SpeciesList(
+            [
+                "Mycena haematopus",
+                "Mycena pura",
+                "Amanita muscaria",
+                "Amanita phalloides",
+                "Laetiporus gilbertsonii",
+                "Psathyrella candolleana",
+                "Russula brevipes",
+                "Xylaria hypoxylon",
+                "Boletus rex-veris",
+                "Linnaea borealis",
+                "Oenothera speciosa",
+                "Ziziphus jujuba",
+                "Calypso bulbosa",
+                "Zale termina",
+                "Alces alces",
+            ]
+        )
+
+    @pytest.mark.parametrize(
+        "heard, expected",
+        [
+            (
+                "This is Mycena hematopis on a log.",
+                "This is Mycena haematopus on a log.",
+            ),
+            ("Here is my Sina hematopus.", "Here is Mycena haematopus."),
+            ("this is amanita muscaria", "this is Amanita muscaria"),
+            ("next to it Amanita Phalloides.", "next to it Amanita phalloides."),
+            (
+                "Lady Porous Gilbert Sony on this oak",
+                "Laetiporus gilbertsonii on this oak",
+            ),
+            (
+                "Sathyrella candoliana in the lawn",
+                "Psathyrella candolleana in the lawn",
+            ),
+            ("Zylaria hypozylon, candlesnuff", "Xylaria hypoxylon, candlesnuff"),
+            ("Boletus rex veris in spring", "Boletus rex-veris in spring"),
+            ("That's Russula brevipies.", "That's Russula brevipes."),
+        ],
+    )
+    def test_misheard_names_are_respelled(self, heard, expected):
+        assert self._species().correct(heard) == expected
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "A fly agaric growing here, some russulas and amanitas under the pines.",
+            "I think the Amanita is really muscular.",
+            "My scene is pure and the camera is rolling.",
+            "Mycena, haematopus",
+            "This line really isn't needed.",
+            "There is no other spec is there?",
+            "Sisyphus pushed the CALYPSO boulder.",
+            "This licence shall terminate at once.",
+            "It compares the hashes hashes again.",
+            "Mycena is purely a guess.",
+        ],
+    )
+    def test_ordinary_speech_is_left_alone(self, text):
+        assert self._species().correct(text) == text
+
+    def test_lone_genus_is_respelled_only_when_it_sounds_identical(self):
+        species = self._species()
+
+        assert species.correct("A micena on the moss.") == "A Mycena on the moss."
+        assert species.correct("Some Mycenas here.") == "Some Mycenas here."
+
+    def test_three_letter_genera_are_matched(self):
+        species = video_rename.SpeciesList(["Zea mays", "Bos taurus"])
+
+        assert species.correct("zea mais in the field") == "Zea mays in the field"
+        assert species.correct("a bos taurus calf") == "a Bos taurus calf"
+        # After so short a genus, the species must sound identical.
+        assert species.correct("the sea maze was fun") == "the sea maze was fun"
+        assert species.correct("the boss tours us") == "the boss tours us"
+
+    def test_names_in_finds_listed_names_in_order(self):
+        text = "Russula brevipes beside amanita muscaria, and Russula densifolia."
+
+        assert self._species().names_in(text) == [
+            ("Russula", "brevipes"),
+            ("Amanita", "muscaria"),
+        ]
+
+    def test_listed_names_lead_the_suggestion_whatever_their_ending(self):
+        transcript = "So this is Russula brevipes under the pines, very common here."
+
+        assert video_rename.suggest_description(transcript).startswith("russula")
+        assert video_rename.suggest_description(
+            transcript, species=self._species()
+        ).startswith("Russula brevipes")
+
+    def test_list_file_formats(self, tmp_path):
+        names = tmp_path / "names.txt"
+        names.write_text(
+            "﻿# My names\n\nMycena haematopus\nMYCENA PURA (Pers.) P. Kumm.\n"
+            "Ganoderma applanatum,Artist's conk\nFomitopsis mounceae\tRed belt\n"
+            "Hygrocybe sp. 'singeri-CA01'\nHelvella\nAmanita Pers.\n",
+            encoding="utf-8",
+        )
+
+        species = video_rename.load_species_list(names)
+
+        # MYCENA PURA and "Amanita Pers." have no lowercase species word, so
+        # only their genus is kept.
+        assert species.count == 6
+        assert species.correct("ganoderma aplanatum") == "Ganoderma applanatum"
+        assert species.correct("Fomitopsis mounsay") == "Fomitopsis mounceae"
+        assert species.names_in("Hygrocybe sp") == []
+
+    def test_transcripts_are_corrected_but_cached_as_heard(self, tmp_path):
+        video = tmp_path / "IMG_1.mp4"
+        video.write_bytes(b"video bytes")
+        backend = MagicMock(return_value="This is Mycena hematopis.")
+
+        plain = video_rename.Transcriber("base", backend=backend)
+        with patch.object(
+            video_rename.Transcriber, "_extract_audio", return_value=True
+        ):
+            assert plain.transcript(video) == "This is Mycena hematopis."
+
+        # The same cached text is corrected once a list is in use, without
+        # running the recognizer again.
+        corrected = video_rename.Transcriber(
+            "base", backend=backend, species=self._species()
+        )
+        assert corrected.transcript(video) == "This is Mycena haematopus."
+        assert backend.call_count == 1
+
+    def test_fresh_transcripts_are_corrected(self, tmp_path):
+        video = tmp_path / "IMG_1.mp4"
+        video.write_bytes(b"video bytes")
+        backend = MagicMock(return_value="amanita muscaria under pines")
+        transcriber = video_rename.Transcriber(
+            "base", backend=backend, species=self._species()
+        )
+
+        with patch.object(
+            video_rename.Transcriber, "_extract_audio", return_value=True
+        ):
+            assert transcriber.transcript(video) == "Amanita muscaria under pines"
+
+    def test_hand_corrections_are_never_respelled(self, tmp_path):
+        video = tmp_path / "IMG_1.mp4"
+        video.write_bytes(b"video bytes")
+        transcriber = video_rename.Transcriber(
+            "base", backend=MagicMock(), species=self._species()
+        )
+
+        assert transcriber.remember(video, "Mycena hematopis, as I typed it")
+
+        again = video_rename.Transcriber(
+            "base", backend=MagicMock(), species=self._species()
+        )
+        assert again.transcript(video) == "Mycena hematopis, as I typed it"
+
+    def test_catalog_suggestion_uses_the_list(self, tmp_path):
+        video = tmp_path / "IMG_1.mp4"
+        video.write_bytes(b"video")
+        transcriber = MagicMock(species=self._species())
+        transcriber.transcript.return_value = "Russula brevipes under the pines"
+
+        with (
+            patch("video_rename.get_exif_data", return_value={}),
+            patch("video_rename.get_location_info", return_value=None),
+        ):
+            row = video_rename.build_catalog_row(video, transcriber=transcriber)
+
+        assert row["suggested_description"] == "Russula brevipes under pines"
+
+    def test_included_list_loads_and_corrects(self):
+        species = video_rename.load_species_list(video_rename.DEFAULT_SPECIES_LIST)
+
+        assert species.count > 8000
+        assert (
+            species.correct("silocybe zapotekorum in Mexico")
+            == "Psilocybe zapotecorum in Mexico"
+        )
+        assert species.correct("Griffola frondoza") == "Grifola frondosa"
+
+    def test_species_list_requires_transcribe(self, capsys):
+        argv = ["video_rename.py", ".", "--species-list", "x"]
+        with patch.object(sys, "argv", argv), pytest.raises(SystemExit):
+            video_rename.main()
+
+        assert "--species-list can only be used with --transcribe" in (
+            capsys.readouterr().err
+        )
+
+
+class TestSpeciesCorrectionOnRealNarration:
+    """Cases from real field narration and ordinary English, with the included list."""
+
+    @pytest.fixture(scope="class")
+    @classmethod
+    def species(cls):
+        return video_rename.load_species_list(video_rename.DEFAULT_SPECIES_LIST)
+
+    @pytest.mark.parametrize(
+        "heard, expected",
+        [
+            ("Amanita okriata", "Amanita ocreata"),
+            ("Aminita Velosa", "Amanita velosa"),
+            ("Quarkus agrofolia", "Quercus agrifolia"),
+            ("Armalaia gallica", "Armillaria gallica"),
+            ("Copernopsis eulognicola", "Coprinopsis uliginicola"),
+            ("Phibula stilbum Phylacicola", "Fibulostilbum phylaciicola"),
+            ("psilocybe young Genzis", "Psilocybe yungensis"),
+            ("paniolus papillonaceous", "Panaeolus papilionaceus"),
+            ("we have my Sina hematopus", "we have Mycena haematopus"),
+            ("Tricholomopsis area", "Tricholomopsis aurea"),
+            ("some rusula here", "some Russula here"),
+            ("AMANITA MUSCARIA", "Amanita muscaria"),
+        ],
+    )
+    def test_names_are_respelled(self, species, heard, expected):
+        assert species.correct(heard) == expected
+
+    @pytest.mark.parametrize(
+        "heard, expected",
+        [
+            # The word before a name must not be swallowed.
+            ("we have Panellus cinctulus", "we have Panaeolus cinctulus"),
+            ("look at these Panellus cinctulus", "look at these Panaeolus cinctulus"),
+            ("in the Hovella lacunosa group", "in the Helvella lacunosa group"),
+            ("the real Hovella lacunosa", "the real Helvella lacunosa"),
+            ("This is Mycena hematopis.", "This is Mycena haematopus."),
+        ],
+    )
+    def test_the_word_before_a_name_is_kept(self, species, heard, expected):
+        assert species.correct(heard) == expected
+
+    def test_a_real_genus_is_swapped_only_for_a_near_identical_one(self, species):
+        assert species.correct("Panellus cinctulus") == "Panaeolus cinctulus"
+        assert species.correct("Panellus stipticus") == "Panellus stipticus"
+        assert species.correct("Ophiocordyceps nidus") == "Ophiocordyceps nidus"
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "oak-loving tricholoma and dryophilum means oak",
+            "they're a fuchsia color",
+            "a cancer, a hydrangea, a sequoia, a sphinx, capsicum and asparagus",
+            "the stack is built here",
+            "the status Status line",
+            "hstatus status",
+            "Opcode A memory",
+            "ALIASES Aliases",
+            "I was out with Andrea today",
+            "Andrea found this one.",
+            "LarryX is here",
+            "the sea maze was fun",
+        ],
+    )
+    def test_ordinary_speech_is_left_alone(self, species, text):
+        assert species.correct(text) == text
