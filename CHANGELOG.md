@@ -8,6 +8,18 @@ commit date rather than release tag; the `v1.2` tag covers the 2026-10-24 and
 
 ### Added
 
+- The transcript in the review screen is now editable. Corrections are saved
+  to the transcript file (marked "Edited by hand"), update the suggested
+  description, and are never overwritten by automatic transcription.
+- Added a **B-roll** checkbox (`Ctrl+B`) to the review screen that adds a
+  `broll` tag after the description in the new name, and a `b_roll` column to
+  the catalog.
+
+### Changed
+
+- Transcript files are no longer saved for clips with fewer than 15 spoken
+  words, unless the transcript was edited by hand.
+
 - Added `--catalog CSV_FILE`, which writes a spreadsheet of every video
   (description, date, location, orientation, duration, resolution and size)
   without renaming anything. The CSV includes a UTF-8 byte-order mark so

@@ -1670,6 +1670,12 @@ class TestCatalogArguments:
 
 
 class TestTranscriptFiles:
+    @pytest.fixture(autouse=True)
+    def _short_transcripts_count(self, monkeypatch):
+        # These tests use short sample transcripts; the word minimum has its
+        # own tests in TestTranscriptWordMinimum.
+        monkeypatch.setattr(video_rename, "MIN_TRANSCRIPT_WORDS", 1)
+
     def test_saves_a_marked_text_file_beside_the_video(self, tmp_path):
         video = tmp_path / "IMG_0001.mov"
         video.write_bytes(b"v")
@@ -1812,6 +1818,194 @@ class TestTranscriptFiles:
 
         get_files.assert_not_called()
         assert "--save-transcripts can only be used" in capsys.readouterr().err
+
+
+LONG_TRANSCRIPT = (
+    "Eyes down everybody, here we have a lovely cluster of Mycena growing "
+    "on this old mossy log in the rain"
+)
+
+
+class TestTranscriptWordMinimum:
+    def test_short_transcript_is_not_saved(self, tmp_path):
+        video = tmp_path / "IMG_0100.mov"
+
+        assert video_rename.save_transcript_file(video, "wind and a bird") is None
+        assert not (tmp_path / "IMG_0100.txt").exists()
+
+    def test_fifteen_words_are_saved(self, tmp_path):
+        video = tmp_path / "IMG_0101.mov"
+        words = " ".join(["moth"] * video_rename.MIN_TRANSCRIPT_WORDS)
+
+        assert video_rename.save_transcript_file(video, words) is not None
+
+    def test_hand_edit_is_saved_even_when_short(self, tmp_path):
+        video = tmp_path / "IMG_0102.mov"
+
+        path = video_rename.save_transcript_file(video, "Amanita", edited=True)
+
+        assert path is not None
+        assert video_rename.read_transcript_file(video) == ("Amanita", True)
+
+    @patch("video_rename.get_location_info", return_value=None)
+    @patch("video_rename.get_exif_data", return_value={})
+    def test_catalog_skips_short_transcripts(self, _exif, _location, tmp_path):
+        video = tmp_path / "IMG_0103.mp4"
+        video.write_bytes(b"a")
+        transcriber = MagicMock(model_name="base")
+        transcriber.transcript.return_value = "birds singing"
+
+        video_rename.write_catalog(
+            [video], tmp_path / "clips.csv", transcriber=transcriber,
+            save_transcripts=True,
+        )
+
+        assert not (tmp_path / "IMG_0103.txt").exists()
+
+
+class TestEditedTranscripts:
+    def test_automatic_transcript_never_replaces_an_edit(self, tmp_path):
+        video = tmp_path / "IMG_0200.mov"
+        video_rename.save_transcript_file(video, "Mycena haematopus", edited=True)
+
+        video_rename.save_transcript_file(video, LONG_TRANSCRIPT)
+
+        assert video_rename.read_transcript_file(video) == ("Mycena haematopus", True)
+
+    def test_review_shows_the_edited_transcript(self, tmp_path):
+        video = tmp_path / "IMG_0201.mp4"
+        video_rename.save_transcript_file(video, "Mycena leaiana", edited=True)
+        server = TestInteractiveTranscripts._server(items=1)
+        server.review_items[0]["path"] = video
+        server.dry_run = False
+        server.save_transcripts = True
+        server.transcriber = MagicMock(model_name="base")
+
+        video_rename._transcribe_review_items(server)
+
+        server.transcriber.transcript.assert_not_called()
+        entry = server.transcripts[0]
+        assert entry["transcript"] == "Mycena leaiana"
+        assert entry["edited"] is True
+
+    def _server(self, video, dry_run=False):
+        server = TestInteractiveTranscripts._server(items=1)
+        server.review_items[0]["path"] = video
+        server.dry_run = dry_run
+        server.save_transcripts = True
+        server.rename_lock = Lock()
+        server.transcriber = MagicMock(model_name="small.en")
+        return server
+
+    def test_saving_an_edit_writes_the_file(self, tmp_path):
+        video = tmp_path / "IMG_0202.mp4"
+        server = self._server(video)
+
+        entry = video_rename._save_edited_transcript(
+            server, server.review_items[0], "  Hygrocybe conica  "
+        )
+
+        assert entry["saved"] is True
+        assert entry["suggestion"]
+        assert server.transcripts[0]["transcript"] == "Hygrocybe conica"
+        assert video_rename.read_transcript_file(video) == ("Hygrocybe conica", True)
+        assert video_rename.TRANSCRIPT_EDITED_LINE in transcript_text(video)
+
+    def test_dry_run_edit_writes_nothing(self, tmp_path):
+        video = tmp_path / "IMG_0203.mp4"
+        server = self._server(video, dry_run=True)
+
+        entry = video_rename._save_edited_transcript(
+            server, server.review_items[0], "Hygrocybe conica"
+        )
+
+        assert entry["saved"] is False
+        assert server.transcripts[0]["transcript"] == "Hygrocybe conica"
+        assert not list(tmp_path.iterdir())
+
+    def test_clearing_an_edit_removes_the_file(self, tmp_path, fake_trash):
+        video = tmp_path / "IMG_0204.mp4"
+        video_rename.save_transcript_file(video, LONG_TRANSCRIPT)
+        server = self._server(video)
+
+        video_rename._save_edited_transcript(server, server.review_items[0], "  ")
+
+        assert not (tmp_path / "IMG_0204.txt").exists()
+        assert (fake_trash / "IMG_0204.txt").exists()
+
+    def test_edit_must_be_text(self, tmp_path):
+        server = self._server(tmp_path / "IMG_0205.mp4")
+
+        with pytest.raises(TypeError):
+            video_rename._save_edited_transcript(server, server.review_items[0], 5)
+
+    def test_review_page_has_an_editable_transcript(self):
+        assert '<textarea id="transcript"' in _INTERACTIVE_HTML
+        assert "/api/transcript'" in _INTERACTIVE_HTML
+
+
+class TestBroll:
+    @pytest.mark.parametrize(
+        "text, expected",
+        [
+            ("bear fishing broll", ("bear fishing", True)),
+            ("bear fishing B-roll", ("bear fishing", True)),
+            ("bear_fishing_b_roll", ("bear_fishing", True)),
+            ("broll", ("", True)),
+            ("trolling for bolete", ("trolling for bolete", False)),
+            ("bankroll", ("bankroll", False)),
+        ],
+    )
+    def test_split_broll(self, text, expected):
+        assert video_rename._split_broll(text) == expected
+
+    def test_name_gets_broll_after_the_description(self, tmp_path):
+        path = _build_descriptive_path(
+            tmp_path / "IMG_1.mp4", "forest floor", "2026-11-16", "USA_CA",
+            "horizontal", "IMG_1", broll=True,
+        )
+        assert path.name == "IMG_1_forest_floor_broll_2026-11-16_USA_CA_horizontal.mp4"
+
+    def test_broll_typed_in_description_is_not_doubled(self, tmp_path):
+        path = _build_descriptive_path(
+            tmp_path / "IMG_1.mp4", "forest broll", None, None, "vertical",
+            "IMG_1", broll=True,
+        )
+        assert path.name == "IMG_1_forest_broll_vertical.mp4"
+
+    def test_broll_alone_is_enough_to_rename(self, tmp_path):
+        path = _build_descriptive_path(
+            tmp_path / "IMG_1.mp4", "", None, None, "vertical", "IMG_1", broll=True
+        )
+        assert path.name == "IMG_1_broll_vertical.mp4"
+
+    def test_rename_records_broll(self, tmp_path):
+        video = tmp_path / "IMG_1234_horizontal.mp4"
+        video.write_bytes(b"a")
+        handler = TestInteractiveRename._handler()
+        item = TestInteractiveRename._item(video)
+
+        handler._rename(item, "Rainy forest", broll=True)
+
+        assert item["path"].name.startswith("IMG_1234_Rainy_forest_broll")
+        assert item["description"] == "Rainy forest"
+        assert item["broll"] is True
+
+    def test_existing_broll_name_ticks_the_box(self, tmp_path):
+        video = tmp_path / "IMG_1234_moss_broll_horizontal.mp4"
+        item = _prepare_review_item(video, 0, skip_metadata_if_described=True)
+        assert item["description"] == "moss"
+        assert item["broll"] is True
+        assert video_rename._public_review_item(item)["broll"] is True
+
+    def test_broll_only_name_counts_as_described(self, tmp_path):
+        video = tmp_path / "IMG_1234_broll_horizontal.mp4"
+        item = _prepare_review_item(video, 0, skip_metadata_if_described=True)
+        assert item["description"] == ""
+        assert item["described"] is True
+
+    def test_review_page_has_a_broll_checkbox(self):
+        assert 'type="checkbox" id="broll"' in _INTERACTIVE_HTML
 
 
 def transcript_text(video):

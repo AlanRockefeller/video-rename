@@ -611,11 +611,36 @@ def _description_parts(stem, date_str=None, location_str=None, orientation=None)
     return base_stem, description.strip("_ -").replace("_", " ")
 
 
+BROLL_TOKEN = "broll"
+_BROLL_SUFFIX_RE = re.compile(r"(?:^|[\s_-]+)b[\s_-]?roll$", re.IGNORECASE)
+
+
+def _split_broll(description):
+    """Return (description, is_broll), removing a trailing "broll" tag."""
+    description = (description or "").strip()
+    match = _BROLL_SUFFIX_RE.search(description)
+    if not match:
+        return description, False
+    return description[: match.start()].strip(" _-"), True
+
+
 def _build_descriptive_path(
-    file_path, description, date_str, location_str, orientation, base_stem=""
+    file_path,
+    description,
+    date_str,
+    location_str,
+    orientation,
+    base_stem="",
+    broll=False,
 ):
     """Build the canonical interactive filename from its useful components."""
-    safe_description = _sanitize_description(description)
+    description, typed_broll = _split_broll(description)
+    broll = broll or typed_broll
+    safe_description = "_".join(
+        part
+        for part in (_sanitize_description(description), BROLL_TOKEN if broll else "")
+        if part
+    )
     if not safe_description:
         raise ValueError("Please enter a description before saving.")
 
@@ -1027,6 +1052,10 @@ class Transcriber:
 # --- Transcript files ---
 
 TRANSCRIPT_FILE_MARKER = "# Transcript written by video-rename"
+TRANSCRIPT_EDITED_LINE = "Edited by hand in the review screen."
+# Fewer spoken words than this is usually wind, birds or a stray remark, not
+# narration, so no transcript file is saved for the clip.
+MIN_TRANSCRIPT_WORDS = 15
 
 
 def transcript_file_path(video_path):
@@ -1044,20 +1073,52 @@ def _is_transcript_file(path):
         return False
 
 
-def save_transcript_file(video_path, transcript, model_name=None):
+def _transcript_word_count(transcript):
+    """Count the spoken words in a transcript."""
+    return len((transcript or "").split())
+
+
+def read_transcript_file(video_path):
+    """Return (text, edited) from a transcript file this program wrote.
+
+    Returns (None, False) when there is no such file.  ``edited`` is True when
+    the text was corrected by hand in the review screen.
+    """
+    path = transcript_file_path(video_path)
+    if not _is_transcript_file(path):
+        return None, False
+    try:
+        content = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return None, False
+    header, _, body = content.partition("\n\n")
+    edited = TRANSCRIPT_EDITED_LINE in header.splitlines()
+    return body.strip(), edited
+
+
+def save_transcript_file(video_path, transcript, model_name=None, edited=False):
     """Save a transcript as a text file beside its video.
 
-    Silent videos get no file. A text file with the same name that this
-    program did not write is never overwritten. Returns the path written,
-    or None.
+    Clips with fewer than MIN_TRANSCRIPT_WORDS spoken words (usually b-roll
+    with stray noise) get no file, unless the text was edited by hand.  A
+    hand-edited file is never replaced by a fresh automatic transcript.  A text
+    file with the same name that this program did not write is never
+    overwritten.  Returns the path written, or None.
     """
+    transcript = (transcript or "").strip()
     if not transcript:
+        return None
+    if not edited and _transcript_word_count(transcript) < MIN_TRANSCRIPT_WORDS:
         return None
     path = transcript_file_path(video_path)
     if path.exists() and not _is_transcript_file(path):
         print(f"Warning: Not saving transcript; {path.name} already exists.")
         return None
+    if not edited and read_transcript_file(video_path)[1]:
+        return path
     lines = [TRANSCRIPT_FILE_MARKER]
+    if edited:
+        lines.append(TRANSCRIPT_EDITED_LINE)
     if model_name:
         lines.append(
             f"Speech model: {Path(str(model_name)).name}. Covers up to the first "
@@ -1174,6 +1235,7 @@ CATALOG_FIELDS = (
     "path",
     "filename",
     "description",
+    "b_roll",
     "date",
     "location",
     "orientation",
@@ -1220,6 +1282,7 @@ def build_catalog_row(
     _base_stem, description = _description_parts(
         file_path.stem, date_str, location_str, orientation
     )
+    description, broll = _split_broll(description)
     seconds = _duration_seconds(exif_data)
     try:
         size_mb = round(file_path.stat().st_size / (1024 * 1024), 1)
@@ -1237,6 +1300,7 @@ def build_catalog_row(
         "path": display_path,
         "filename": file_path.name,
         "description": description,
+        "b_roll": "yes" if broll else "",
         "date": date_str or "",
         "location": location_str or "",
         "orientation": orientation,
@@ -1247,10 +1311,11 @@ def build_catalog_row(
         "size_mb": size_mb,
     }
     if transcriber is not None:
-        transcript = transcriber.transcript(file_path)
+        edited_text, edited = read_transcript_file(file_path)
+        transcript = edited_text if edited else transcriber.transcript(file_path)
         row["transcript"] = transcript or ""
         row["suggested_description"] = suggest_description(transcript)
-        if save_transcripts:
+        if save_transcripts and not edited:
             save_transcript_file(file_path, transcript, transcriber.model_name)
     if debug:
         print(f"[DEBUG] catalog row: {row}")
@@ -1348,7 +1413,14 @@ _INTERACTIVE_HTML = r"""<!doctype html>
     .suggest { display:flex; flex-wrap:wrap; gap:10px; align-items:center; }
     #use-suggestion { background:#1f3b2c; border-color:#3f7a57; color:#c9f2d9; }
     #use-suggestion:hover { background:#285038; }
-    #transcript { color:var(--muted); font-size:14px; max-height:6.5em; overflow:auto; margin-top:8px; overflow-wrap:anywhere; }
+    #transcript { display:block; width:100%; min-height:6.5em; margin-top:8px; padding:10px 12px; resize:vertical;
+      font:14px/1.45 system-ui,sans-serif; color:#d5dde8; background:#101319; border:1px solid #3a4352; border-radius:8px; outline:none; }
+    #transcript:focus { border-color:var(--accent); box-shadow:0 0 0 3px #72a7ff25; }
+    #transcript:disabled { color:var(--muted); }
+    #transcript-status { color:var(--muted); font-size:13px; margin-top:4px; min-height:1.3em; }
+    .check { display:inline-flex; align-items:center; gap:8px; margin-top:10px; cursor:pointer; user-select:none; }
+    .check input { width:18px; height:18px; margin:0; padding:0; accent-color:var(--accent); cursor:pointer; }
+    .check small { color:var(--muted); }
     @media (max-width:650px) { main{padding:12px}.hint{width:100%;margin:4px 0 0} }
   </style>
 </head>
@@ -1369,11 +1441,13 @@ _INTERACTIVE_HTML = r"""<!doctype html>
       <div class="row">
         <label class="label" for="description">Description</label>
         <input id="description" autocomplete="off" maxlength="160" placeholder="What happens in this video?">
+        <label class="check"><input type="checkbox" id="broll"> B-roll <small>(adds “broll” to the name)</small></label>
       </div>
       <div class="row" id="suggestion-row" hidden>
         <div class="label">Heard in this clip</div>
         <div class="suggest"><button type="button" id="use-suggestion" hidden></button><span class="hint" id="suggestion-hint" hidden>Tab uses the suggestion</span></div>
-        <div id="transcript"></div>
+        <textarea id="transcript" spellcheck="true" disabled aria-label="Transcript (editable)"></textarea>
+        <div id="transcript-status"></div>
       </div>
       <div class="row"><div class="label">Proposed name</div><div class="filename" id="proposed"></div></div>
       <div class="actions">
@@ -1382,7 +1456,7 @@ _INTERACTIVE_HTML = r"""<!doctype html>
         <button type="button" class="primary" id="save">Rename &amp; next</button>
         <button type="button" class="danger" id="delete">Delete…</button>
         <button type="button" id="finish">Finish</button>
-        <span class="hint">Ctrl+Enter rename · Ctrl+→ skip · Alt+←/→ seek</span>
+        <span class="hint">Ctrl+Enter rename · Ctrl+→ skip · Ctrl+B b-roll · Alt+←/→ seek</span>
       </div>
       <div id="message" role="alert"></div>
     </div>
@@ -1399,7 +1473,9 @@ const $ = id => document.getElementById(id);
 let items = [], position = 0, busy = false, scanComplete = false, dryRun = false;
 const knownItemIds = new Set();
 let scanned = 0, total = 0, itemOffset = 0, stopped = false, pollTimer = null, locationTimer = null;
-let transcriptsEnabled = false, transcriptTimer = null;
+let transcriptsEnabled = false, transcriptTimer = null, saveTranscripts = false;
+// The clip whose transcript is in the edit box, and whether it has unsaved edits.
+let transcriptItem = null, transcriptDirty = false;
 const defaultPlaceholder = 'What happens in this video?';
 function cleanDescription(value) {
   return value.trim().replace(/[<>:"/\\|?*\x00-\x1f]/g, ' ')
@@ -1415,8 +1491,11 @@ function containsDate(text, date) {
   }
   return false;
 }
-function proposedName(item, description) {
-  const clean = cleanDescription(description) || '[description]';
+const brollSuffix = /(?:^|[\s_-]+)b[\s_-]?roll$/i;
+function proposedName(item, description, broll = $('broll').checked) {
+  let text = description.trim();
+  if (brollSuffix.test(text)) { text = text.replace(brollSuffix, ''); broll = true; }
+  const clean = [cleanDescription(text), broll ? 'broll' : ''].filter(Boolean).join('_') || '[description]';
   const date = containsDate(`${item.base_stem}_${clean}`, item.date) ? null : item.date;
   return [item.base_stem, clean, date, item.location, item.orientation]
     .filter(Boolean).join('_') + item.extension;
@@ -1464,17 +1543,59 @@ function scheduleLocationLookup(item) {
 function showTranscript(item) {
   clearTimeout(transcriptTimer);
   const info = item.transcriptInfo;
+  const box = $('transcript');
   $('suggestion-row').hidden = !transcriptsEnabled;
+  transcriptItem = null; transcriptDirty = false;
+  showSuggestion(null);
+  if (!transcriptsEnabled) return;
+  box.disabled = true; box.value = ''; $('transcript-status').textContent = '';
+  if (!info) { box.placeholder = 'Listening to this clip…'; loadTranscript(item); return; }
+  if (info.status !== 'ready') { box.placeholder = 'No transcript is available for this clip.'; return; }
+  box.placeholder = 'No speech detected. Type here to add a transcript.';
+  box.value = info.transcript || '';
+  box.disabled = false; transcriptItem = item;
+  showSuggestion(info); showTranscriptStatus(info);
+}
+function showSuggestion(info) {
   $('use-suggestion').hidden = true; $('suggestion-hint').hidden = true;
   $('description').placeholder = defaultPlaceholder;
-  if (!transcriptsEnabled) return;
-  if (!info) { $('transcript').textContent = 'Listening to this clip…'; loadTranscript(item); return; }
-  if (info.status !== 'ready') { $('transcript').textContent = 'No transcript is available for this clip.'; return; }
-  $('transcript').textContent = info.transcript || 'No speech detected.';
-  if (info.suggestion) {
+  if (info && info.suggestion) {
     $('use-suggestion').textContent = `Use “${info.suggestion}”`;
     $('use-suggestion').hidden = false; $('suggestion-hint').hidden = false;
     $('description').placeholder = info.suggestion;
+  }
+}
+function showTranscriptStatus(info, note) {
+  let text;
+  if (note) text = note;
+  else if (dryRun) text = 'Practice mode: you can edit this, but no transcript file is saved.';
+  else if (!saveTranscripts) text = 'You can edit this; edits only last until you finish.';
+  else if (info.edited && info.transcript) text = 'Your corrected transcript is saved next to the clip.';
+  else if (info.edited) text = 'Transcript cleared: no transcript file for this clip.';
+  else if (info.word_count < info.min_words) {
+    text = info.word_count
+      ? `Only ${info.word_count} word${info.word_count === 1 ? '' : 's'} heard, so no transcript file is saved. Edit it to save one anyway.`
+      : 'No transcript file is saved for clips without speech.';
+  } else text = 'Fix any mistakes here; your changes save when you click away.';
+  $('transcript-status').textContent = text;
+}
+// Send the edit box's text to the server if it changed.  The clip is captured
+// first, so moving on to the next video right away is safe.
+async function flushTranscript() {
+  if (!transcriptDirty || !transcriptItem) return;
+  const item = transcriptItem, text = $('transcript').value;
+  transcriptDirty = false;
+  const onScreen = () => position < items.length && items[position].id === item.id;
+  try {
+    const response = await fetch('/api/transcript', {method:'POST', headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({id:item.id, transcript:text})});
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.error || 'Could not save the transcript');
+    item.transcriptInfo = result.transcript;
+    if (onScreen() && !transcriptDirty) { showSuggestion(result.transcript); showTranscriptStatus(result.transcript); }
+  } catch (error) {
+    if (onScreen()) { transcriptDirty = true; showTranscriptStatus(null, `Transcript not saved: ${error.message}`); }
+    else $('message').textContent = `The transcript edit for ${item.current_name} was not saved: ${error.message}`;
   }
 }
 async function loadTranscript(item) {
@@ -1497,12 +1618,14 @@ function useSuggestion() {
   return true;
 }
 function render() {
+  flushTranscript();
   if (position >= items.length) { waitForItem(); return; }
   const item = items[position];
   $('workspace').hidden = false; $('done').hidden = true;
   updateProgress();
   $('current').textContent = item.current_name;
   $('description').value = item.description || '';
+  $('broll').checked = Boolean(item.broll);
   $('proposed').textContent = proposedName(item, $('description').value);
   $('previous').disabled = position === 0; $('message').textContent = '';
   const video = $('video'); video.pause(); video.src = `/video/${item.id}/browser`; video.load();
@@ -1515,6 +1638,7 @@ function updateProgress() {
   $('progress').textContent = scanComplete ? ready : `${ready} · scanning ${scanned}/${total}`;
 }
 function waitForItem() {
+  flushTranscript();
   $('workspace').hidden = true; $('done').hidden = false;
   $('done-title').textContent = 'Finding the next undescribed video…';
   $('done-message').textContent = `Scanned ${scanned} of ${total} files.`;
@@ -1543,15 +1667,17 @@ async function renameCurrent() {
   if (busy || position >= items.length) return;
   const item = items[position];
   const missing = 'Enter a description, or choose Skip.';
-  if (!cleanDescription($('description').value)) { $('message').textContent = missing; return; }
+  const hasName = () => cleanDescription($('description').value) || $('broll').checked;
+  if (!hasName()) { $('message').textContent = missing; return; }
   setBusy(true); $('message').textContent = '';
   try {
     clearTimeout(locationTimer); await ensureLocation(item);
     // Read the description after the lookup, which may have corrected it.
-    const description = $('description').value;
-    if (!cleanDescription(description)) throw new Error(missing);
+    const description = $('description').value, broll = $('broll').checked;
+    if (!hasName()) throw new Error(missing);
+    await flushTranscript();
     const response = await fetch('/api/rename', {method:'POST', headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({id:item.id, description})});
+      body:JSON.stringify({id:item.id, description, broll})});
     const result = await response.json();
     if (!response.ok) throw new Error(result.error || 'Rename failed');
     Object.assign(item, result.item); setBusy(false); next();
@@ -1559,7 +1685,8 @@ async function renameCurrent() {
 }
 async function finish() {
   if (busy || stopped) return;
-  stopped = true; clearTimeout(pollTimer); $('video').pause(); completeView();
+  stopped = true; clearTimeout(pollTimer); $('video').pause();
+  await flushTranscript(); completeView();
   try { await fetch('/api/finish', {method:'POST', headers:{'Content-Type':'application/json'}, body:'{}'}); } catch (_) {}
 }
 async function deleteCurrent() {
@@ -1570,6 +1697,7 @@ async function deleteCurrent() {
     : `Move “${item.current_name}” to the Trash?\n\nYou can restore it from the Trash later.`;
   if (!window.confirm(prompt)) return;
   setBusy(true); $('message').textContent = '';
+  transcriptDirty = false;
   const video = $('video'); video.pause(); video.removeAttribute('src'); video.load();
   try {
     const response = await fetch('/api/delete', {method:'POST', headers:{'Content-Type':'application/json'},
@@ -1594,7 +1722,7 @@ async function refreshItems() {
     });
     itemOffset = data.next_offset;
     scanComplete = data.scan_complete; scanned = data.scanned; total = data.total; dryRun = data.dry_run;
-    transcriptsEnabled = Boolean(data.transcripts);
+    transcriptsEnabled = Boolean(data.transcripts); saveTranscripts = Boolean(data.save_transcripts);
     if ($('workspace').hidden && position < items.length) render();
     else if (position >= items.length && scanComplete) finish();
     else if ($('workspace').hidden) waitForItem();
@@ -1617,6 +1745,14 @@ $('description').addEventListener('keydown', event => {
   }
 });
 $('use-suggestion').addEventListener('click', useSuggestion);
+$('broll').addEventListener('change', () => {
+  if (position < items.length) $('proposed').textContent = proposedName(items[position], $('description').value);
+});
+$('transcript').addEventListener('input', () => {
+  if (!transcriptItem) return;
+  transcriptDirty = true; showTranscriptStatus(null, 'Unsaved changes; they save when you click away or move on.');
+});
+$('transcript').addEventListener('change', flushTranscript);
 $('save').addEventListener('click', renameCurrent);
 $('delete').addEventListener('click', deleteCurrent);
 $('skip').addEventListener('click', next);
@@ -1636,7 +1772,13 @@ document.querySelectorAll('[data-seek]').forEach(button => button.addEventListen
 }));
 document.addEventListener('keydown', event => {
   const commandKey = event.ctrlKey || event.metaKey;
+  // Arrow-key shortcuts move the cursor while editing the transcript instead.
+  const editingText = event.target === $('transcript');
   if (commandKey && event.key === 'Enter') { event.preventDefault(); renameCurrent(); }
+  else if (event.ctrlKey && !event.metaKey && (event.key === 'b' || event.key === 'B')) {
+    event.preventDefault(); $('broll').checked = !$('broll').checked; $('broll').dispatchEvent(new Event('change'));
+  }
+  else if (editingText) return;
   else if (commandKey && event.key === 'ArrowRight') { event.preventDefault(); next(); }
   else if (event.altKey && (event.key === 'ArrowLeft' || event.key === 'ArrowRight')) {
     event.preventDefault(); $('video').currentTime = Math.max(0, $('video').currentTime + (event.key === 'ArrowLeft' ? -5 : 5));
@@ -1654,6 +1796,7 @@ def _public_review_item(item):
         "current_name": path.name,
         "base_stem": item["base_stem"],
         "description": item["description"],
+        "broll": bool(item.get("broll")),
         "date": item["date"],
         "location": item["location"],
         "orientation": item["orientation"],
@@ -1678,6 +1821,7 @@ def _review_items_response(server, since):
             "scan_complete": server.scan_complete,
             "dry_run": server.dry_run,
             "transcripts": getattr(server, "transcriber", None) is not None,
+            "save_transcripts": bool(getattr(server, "save_transcripts", False)),
         }
 
 
@@ -1720,11 +1864,14 @@ def _prepare_review_item(
                         f"[DEBUG] file: {file_path.name}, existing description: "
                         f"{quick_description} (metadata skipped)"
                     )
+                quick_description, quick_broll = _split_broll(quick_description)
                 return {
                     "id": item_id,
                     "path": file_path,
                     "base_stem": quick_base,
                     "description": quick_description,
+                    "broll": quick_broll,
+                    "described": True,
                     "date": quick_date,
                     "location": None,
                     "orientation": quick_orientation,
@@ -1762,11 +1909,15 @@ def _prepare_review_item(
             f"location: {location_str}, orientation: {orientation}, "
             f"description: {description or '(none)'}"
         )
+    described = bool(description)
+    description, broll = _split_broll(description)
     return {
         "id": item_id,
         "path": file_path,
         "base_stem": base_stem,
         "description": description,
+        "broll": broll,
+        "described": described,
         "date": date_str,
         "location": location_str,
         "orientation": orientation,
@@ -2132,7 +2283,13 @@ class _ReviewRequestHandler(BaseHTTPRequestHandler):
             self._send_json({"ok": True})
             threading.Timer(0.1, self.server.shutdown).start()
             return
-        if route not in ("/api/rename", "/api/open", "/api/geocode", "/api/delete"):
+        if route not in (
+            "/api/rename",
+            "/api/open",
+            "/api/geocode",
+            "/api/delete",
+            "/api/transcript",
+        ):
             self.send_error(404)
             return
         try:
@@ -2148,13 +2305,21 @@ class _ReviewRequestHandler(BaseHTTPRequestHandler):
             if route == "/api/geocode":
                 self._geocode(item)
                 return
+            if route == "/api/transcript":
+                entry = _save_edited_transcript(
+                    self.server, item, request.get("transcript")
+                )
+                self._send_json({"ok": True, "transcript": entry})
+                return
             if route == "/api/delete":
                 deleted_path = _delete_review_item(self.server, item)
                 prefix = "[DRY] DELETE" if self.server.dry_run else "[DELETE]"
                 print(f"{prefix} {deleted_path.name}")
                 self._send_json({"ok": True, "dry_run": self.server.dry_run})
                 return
-            self._rename(item, request.get("description", ""))
+            self._rename(
+                item, request.get("description", ""), bool(request.get("broll"))
+            )
         except (TypeError, ValueError, OSError) as exc:
             self._send_json({"error": str(exc)}, 400)
 
@@ -2168,16 +2333,17 @@ class _ReviewRequestHandler(BaseHTTPRequestHandler):
         )
         with self.server.review_lock:
             item["location"] = location_str
-            item["base_stem"], item["description"] = _description_parts(
+            item["base_stem"], description = _description_parts(
                 item["path"].stem,
                 item["date"],
                 location_str,
                 item["orientation"],
             )
+            item["description"], item["broll"] = _split_broll(description)
             public_item = _public_review_item(item)
         self._send_json({"ok": True, "item": public_item, "definitive": definitive})
 
-    def _rename(self, item, description):
+    def _rename(self, item, description, broll=False):
         if not isinstance(description, str):
             raise TypeError("Description must be text.")
         old_path = item["path"]
@@ -2188,6 +2354,7 @@ class _ReviewRequestHandler(BaseHTTPRequestHandler):
             item["location"],
             item["orientation"],
             item["base_stem"],
+            broll=broll,
         )
         # Compare as text so a capitalization-only change still counts as a
         # rename on Windows, and accept it on case-insensitive filesystems
@@ -2200,7 +2367,8 @@ class _ReviewRequestHandler(BaseHTTPRequestHandler):
                 old_path.rename(new_path)
                 item["path"] = new_path
                 _move_transcript_file(old_path, new_path)
-            item["description"] = description.strip()
+            item["description"], typed_broll = _split_broll(description)
+            item["broll"] = broll or typed_broll
         prefix = "[DRY]" if self.server.dry_run else "[RENAME]"
         print(f"{prefix} {old_path.name} → {new_path.name}")
         public_item = _public_review_item(item)
@@ -2234,6 +2402,52 @@ def _transcript_response(server, item):
     if entry is None:
         return {"status": "unavailable" if failed else "pending"}
     return dict(entry)
+
+
+def _transcript_entry(transcript, edited=False):
+    """Build the browser's view of one clip's transcript."""
+    return {
+        "status": "ready",
+        "transcript": transcript,
+        "suggestion": suggest_description(transcript),
+        "edited": edited,
+        "word_count": _transcript_word_count(transcript),
+        "min_words": MIN_TRANSCRIPT_WORDS,
+    }
+
+
+def _save_edited_transcript(server, item, transcript):
+    """Store a transcript the reviewer corrected, and save it beside the video.
+
+    Returns the updated browser entry.  In a dry run the edit only lasts for
+    this review session.
+    """
+    if not isinstance(transcript, str):
+        raise TypeError("Transcript must be text.")
+    if getattr(server, "transcriber", None) is None:
+        raise ValueError("Transcription is not turned on.")
+    transcript = transcript.strip()
+    entry = _transcript_entry(transcript, edited=True)
+    with server.rename_lock, server.review_lock:
+        if item.get("deleted"):
+            raise ValueError("This video has been deleted.")
+        server.transcripts[item["id"]] = entry
+        entry = dict(entry)
+        entry["saved"] = False
+        if getattr(server, "save_transcripts", False) and not server.dry_run:
+            if transcript:
+                entry["saved"] = bool(
+                    save_transcript_file(
+                        item["path"],
+                        transcript,
+                        server.transcriber.model_name,
+                        edited=True,
+                    )
+                )
+            else:
+                # An emptied transcript means the clip has nothing worth keeping.
+                _remove_transcript_file(item["path"])
+    return entry
 
 
 def _next_transcript_item(server):
@@ -2270,8 +2484,11 @@ def _transcribe_review_items(server):
                 return
             server.stop_event.wait(0.5)
             continue
+        edited_text, edited = read_transcript_file(path)
         try:
-            transcript = server.transcriber.transcript(path)
+            transcript = (
+                edited_text if edited else server.transcriber.transcript(path)
+            )
         except TranscriberUnavailable as exc:
             print(f"Warning: Transcription stopped: {exc}")
             with server.review_lock:
@@ -2280,17 +2497,17 @@ def _transcribe_review_items(server):
         if transcript is None:
             entry = {"status": "unavailable"}
         else:
-            entry = {
-                "status": "ready",
-                "transcript": transcript,
-                "suggestion": suggest_description(transcript),
-            }
+            entry = _transcript_entry(transcript, edited)
         with server.review_lock:
+            if item["id"] in server.transcripts:
+                # The reviewer already saved an edit for this clip.
+                continue
             server.transcripts[item["id"]] = entry
             # Read the path again here: the video may have been renamed
             # while it was being transcribed.
             if (
                 transcript
+                and not edited
                 and getattr(server, "save_transcripts", False)
                 and not server.dry_run
                 and not item.get("deleted")
@@ -2313,7 +2530,11 @@ def _scan_review_items(server, video_files, include_described, debug):
                 skip_metadata_if_described=not include_described,
                 resolve_location=False,
             )
-            if include_described or not item["description"] or item.get("needs_review"):
+            if (
+                include_described
+                or not (item.get("described") or item["description"])
+                or item.get("needs_review")
+            ):
                 with server.review_lock:
                     item["id"] = len(server.review_items)
                     server.review_items.append(item)

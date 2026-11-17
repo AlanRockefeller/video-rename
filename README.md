@@ -64,6 +64,12 @@ For example:
 
 `IMG_1234_bear_fishing_2026-10-24_USA_CA_horizontal.mp4`
 
+Tick **B-roll** (or press `Ctrl+B`) to mark a clip as b-roll. `broll` is added
+after the description, for example
+`IMG_1234_forest_floor_broll_2026-10-24_USA_CA_horizontal.mp4`; a b-roll clip
+may be renamed without a description. Files already named this way open with
+the box ticked, and the catalog has a `b_roll` column.
+
 Useful controls:
 
 - `Ctrl+Enter`: rename and go to the next video
@@ -101,7 +107,9 @@ The first three minutes of each video's audio are transcribed on your own
 computer with [Whisper](https://github.com/openai/whisper); nothing is uploaded.
 Transcription runs in the background, starting with the video on screen and
 working ahead. Under the description field, **Heard in this clip** shows the
-transcript and a suggestion. Species names such as *Amanita muscaria* come
+transcript and a suggestion. The transcript can be edited in place to fix
+misheard words; the edit is saved when the box loses focus or you move on, and
+the suggestion is recalculated from the corrected text. Species names such as *Amanita muscaria* come
 first, followed by the most frequent meaningful words. The suggestion is never
 saved unless you choose it: press **Tab** in an empty description field or
 click the suggestion, then edit it if you like.
@@ -115,8 +123,13 @@ its video, with the same name and a `.txt` extension (for example
 `IMG_6426_amanita_2023-12-09_vertical.txt`). These files can be searched with
 Spotlight or any desktop search, and they stay paired with their video: when a
 video is renamed, its transcript file is renamed too, and deleting a video in
-the review screen moves its transcript file to the Trash with it. Silent videos get no file, and a
-text file the program did not write is never overwritten, moved or deleted.
+the review screen moves its transcript file to the Trash with it. Clips with
+fewer than 15 spoken words (`MIN_TRANSCRIPT_WORDS`) get no file, and a text
+file the program did not write is never overwritten, moved or deleted. A
+transcript corrected in the review screen is saved even when it is short, is
+marked "Edited by hand", and is never replaced by a fresh automatic
+transcript; it is also what the catalog uses. Emptying the box moves the
+transcript file to the Trash.
 
 Add `--vocabulary words.txt` to help Whisper spell names it would otherwise
 guess at, such as species, places and people. The file has one term per line;
