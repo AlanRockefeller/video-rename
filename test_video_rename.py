@@ -2631,3 +2631,71 @@ class TestSpeciesNameCorrection:
         assert "--species-list can only be used with --transcribe" in (
             capsys.readouterr().err
         )
+
+
+class TestSpeciesCorrectionOnRealNarration:
+    """Cases from real field narration and ordinary English, with the included list."""
+
+    @pytest.fixture(scope="class")
+    @classmethod
+    def species(cls):
+        return video_rename.load_species_list(video_rename.DEFAULT_SPECIES_LIST)
+
+    @pytest.mark.parametrize(
+        "heard, expected",
+        [
+            ("Amanita okriata", "Amanita ocreata"),
+            ("Aminita Velosa", "Amanita velosa"),
+            ("Quarkus agrofolia", "Quercus agrifolia"),
+            ("Armalaia gallica", "Armillaria gallica"),
+            ("Copernopsis eulognicola", "Coprinopsis uliginicola"),
+            ("Phibula stilbum Phylacicola", "Fibulostilbum phylaciicola"),
+            ("psilocybe young Genzis", "Psilocybe yungensis"),
+            ("paniolus papillonaceous", "Panaeolus papilionaceus"),
+            ("we have my Sina hematopus", "we have Mycena haematopus"),
+            ("Tricholomopsis area", "Tricholomopsis aurea"),
+            ("some rusula here", "some Russula here"),
+            ("AMANITA MUSCARIA", "Amanita muscaria"),
+        ],
+    )
+    def test_names_are_respelled(self, species, heard, expected):
+        assert species.correct(heard) == expected
+
+    @pytest.mark.parametrize(
+        "heard, expected",
+        [
+            # The word before a name must not be swallowed.
+            ("we have Panellus cinctulus", "we have Panaeolus cinctulus"),
+            ("look at these Panellus cinctulus", "look at these Panaeolus cinctulus"),
+            ("in the Hovella lacunosa group", "in the Helvella lacunosa group"),
+            ("the real Hovella lacunosa", "the real Helvella lacunosa"),
+            ("This is Mycena hematopis.", "This is Mycena haematopus."),
+        ],
+    )
+    def test_the_word_before_a_name_is_kept(self, species, heard, expected):
+        assert species.correct(heard) == expected
+
+    def test_a_real_genus_is_swapped_only_for_a_near_identical_one(self, species):
+        assert species.correct("Panellus cinctulus") == "Panaeolus cinctulus"
+        assert species.correct("Panellus stipticus") == "Panellus stipticus"
+        assert species.correct("Ophiocordyceps nidus") == "Ophiocordyceps nidus"
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "oak-loving tricholoma and dryophilum means oak",
+            "they're a fuchsia color",
+            "a cancer, a hydrangea, a sequoia, a sphinx, capsicum and asparagus",
+            "the stack is built here",
+            "the status Status line",
+            "hstatus status",
+            "Opcode A memory",
+            "ALIASES Aliases",
+            "I was out with Andrea today",
+            "Andrea found this one.",
+            "LarryX is here",
+            "the sea maze was fun",
+        ],
+    )
+    def test_ordinary_speech_is_left_alone(self, species, text):
+        assert species.correct(text) == text

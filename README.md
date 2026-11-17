@@ -151,8 +151,11 @@ many names are known. Whisper spells unfamiliar Latin names by ear, so
 "Mycena hematopis", "my Sina hematopus" or "Lady Porous Gilbert Sony" come out
 as *Mycena haematopus* and *Laetiporus gilbertsonii* when those names are in
 the list. Both words of a name must sound like a listed name; a genus said on
-its own is only respelled when it sounds identical, so ordinary speech is left
-alone. The list that comes with the program, `species_names.txt`, holds the
+its own is only respelled when it sounds identical but is spelled differently
+("rusula" becomes *Russula*, while "a fuchsia color" is left as it is), so
+ordinary speech and people's names are left alone. A real genus is swapped for
+another only when the two sound nearly the same and the species belongs to the
+other one ("Panellus cinctulus" becomes *Panaeolus cinctulus*). The list that comes with the program, `species_names.txt`, holds the
 roughly 8,900 species and genera observed on iNaturalist by alan_rockefeller
 and mandiequark. Add names to it, or use `--species-list names.txt` for your
 own file: one name per line (`Genus` or `Genus species`), with blank lines and

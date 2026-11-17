@@ -909,8 +909,18 @@ _NAME_TOKEN_RE = re.compile(r"[A-Za-z]+(?:-[A-Za-z]+)*")
 SPECIES_MIN_PART_SCORE = 0.72
 SPECIES_MIN_SCORE = 0.82
 # A genus said on its own is only respelled when it sounds identical, starts
-# with the same letter and is long enough not to be an everyday word.
+# with the same letter and is long enough not to be an everyday word.  A
+# capitalized word in mid-sentence is often a person's name, so it must be
+# longer still.
 _LONE_GENUS_MIN_LETTERS = 6
+_LONE_CAPITALIZED_GENUS_MIN_LETTERS = 7
+# A heard word that is itself a listed genus is respelled as another genus
+# only when the two sound at least this alike ("Panellus" for "Panaeolus").
+_RESPELL_REAL_GENUS_SCORE = 0.9
+# When a name could also start one word later ("the Hovella lacunosa"), the
+# reading that keeps the extra word wins unless joining it scores this much
+# better.
+_JOIN_MARGIN = 0.05
 # A heard genus that only nearly matches must have at least this many sounds,
 # and so must its species when that only nearly matches too.  A shorter genus
 # must sound identical, and so must its species.
@@ -948,6 +958,11 @@ def _sound_key(word):
     key = re.sub(r"c(?=[ei])", "s", key).replace("c", "k")
     key = key.replace("h", "")
     return re.sub(r"(.)\1+", r"\1", key)
+
+
+def _is_acronym(word):
+    """Return True for a word written in capitals, such as "ALIASES"."""
+    return len(word) > 1 and word.isupper()
 
 
 def _similarity(first, second):
@@ -1010,23 +1025,33 @@ class SpeciesList:
         folded = word.lower()
         if folded in self._genus_matches:
             return self._genus_matches[folded]
+        key = _sound_key(folded)
         if folded in self._genera:
+            # A real genus may still be a mishearing of a similar one
+            # ("Panellus cinctulus" for "Panaeolus cinctulus"), so near
+            # matches are kept too; the exact one scores highest.
             matches = [(1.0, folded)]
         else:
-            key = _sound_key(folded)
             matches = [(0.99, genus) for genus in self._genera_by_key.get(key, ())]
-            if not matches:
-                shared = {}
-                for trigram in _trigrams(key):
-                    for genus in self._genera_by_trigram.get(trigram, ()):
-                        shared[genus] = shared.get(genus, 0) + 1
-                closest = sorted(shared, key=lambda genus: (-shared[genus], genus))
-                for genus in closest[:_GENUS_CANDIDATES]:
-                    score = _similarity(key, self._genus_keys[genus])
-                    if score >= SPECIES_MIN_PART_SCORE:
-                        matches.append((score, genus))
+        if not matches or matches[0][0] == 1.0:
+            shared = {}
+            for trigram in _trigrams(key):
+                for genus in self._genera_by_trigram.get(trigram, ()):
+                    shared[genus] = shared.get(genus, 0) + 1
+            closest = sorted(shared, key=lambda genus: (-shared[genus], genus))
+            for genus in closest[:_GENUS_CANDIDATES]:
+                if genus == folded:
+                    continue
+                score = min(_similarity(key, self._genus_keys[genus]), 0.98)
+                if score >= SPECIES_MIN_PART_SCORE:
+                    matches.append((score, genus))
         self._genus_matches[folded] = matches
         return matches
+
+    def _is_genus(self, word):
+        """Return True if word is, or sounds identical to, a listed genus."""
+        folded = word.lower()
+        return folded in self._genera or _sound_key(folded) in self._genera_by_key
 
     def _match_epithet(self, genus, word):
         """Return (score, epithet) for the genus's best-sounding species, or None."""
@@ -1058,7 +1083,9 @@ class SpeciesList:
         Whisper sometimes splits an unfamiliar name ("my Sina" for "Mycena").
         Filler words glued together ("no other") are not a name, so when
         ``filler_allowed`` is given, no more than that many of the joined
-        words may be everyday filler.
+        words may be everyday filler.  Filler may begin a split name but not
+        end one ("stack is" is not "Stachys"), and words in capitals are
+        never glued together.
         """
         if start + length > len(tokens):
             return None
@@ -1069,6 +1096,10 @@ class SpeciesList:
         if filler_allowed is not None and length > 1:
             filler = sum(word.lower() in _SUGGESTION_STOPWORDS for word in words)
             if filler > filler_allowed:
+                return None
+            if words[-1].lower() in _SUGGESTION_STOPWORDS:
+                return None
+            if any(_is_acronym(word) for word in words):
                 return None
         return "".join(words)
 
@@ -1081,14 +1112,35 @@ class SpeciesList:
             heard_genus = self._joined(text, tokens, index, genus_length, 1)
             if heard_genus is None:
                 continue
+            if genus_length == 2:
+                first, second = (token.group() for token in tokens[index : index + 2])
+                # "tricholoma and" or "we have Panellus" is a real genus next
+                # to an everyday word, not a name Whisper split in two.
+                if self._is_genus(first) or (
+                    self._is_genus(second) and first.lower() in _SUGGESTION_STOPWORDS
+                ):
+                    continue
             if genus_length == 1 and heard_genus.lower() in _SUGGESTION_STOPWORDS:
                 continue
             if len(heard_genus) < (3 if genus_length == 1 else 6):
                 continue
+            is_listed_genus = heard_genus.lower() in self._genera
+            if heard_genus.lower() in _NOT_EPITHETS and not is_listed_genus:
+                # Everyday words such as "status" are not misheard genera.
+                continue
             for genus_score, genus in self._match_genus(heard_genus):
+                # A real genus is only swapped for one that sounds nearly the
+                # same: "Panellus" for "Panaeolus", not "Ophiocordyceps" for
+                # "Cordyceps".
+                if is_listed_genus and genus_score < _RESPELL_REAL_GENUS_SCORE:
+                    continue
                 # A short word is too easily a near miss for some genus
                 # ("shall" for "Zale").
                 near_genus = genus_score < 0.99
+                # A word in capitals is usually an acronym, so it must sound
+                # identical ("ALIASES" is not a misheard "Alces").
+                if near_genus and _is_acronym(heard_genus):
+                    continue
                 short_genus = len(_sound_key(heard_genus)) < _NEAR_MISS_MIN_KEY
                 if near_genus and short_genus:
                     continue
@@ -1105,10 +1157,28 @@ class SpeciesList:
                     match = self._match_epithet(genus, heard_epithet)
                     if match is None:
                         continue
+                    near_epithet = match[0] < 0.99
+                    if near_epithet and _is_acronym(heard_epithet):
+                        continue
+                    # An everyday word ("status") only counts as a misheard
+                    # species after a genus heard exactly ("Tricholomopsis
+                    # area" for "aurea").
+                    if (
+                        match[0] < 1.0
+                        and near_genus
+                        and heard_epithet.lower() in _NOT_EPITHETS
+                    ):
+                        continue
+                    # The same word twice ("hashes hashes") is only a name
+                    # when it is spelled as one ("Alces alces").
+                    if heard_genus.lower() == heard_epithet.lower() and (
+                        genus_score < 1.0 or match[0] < 1.0
+                    ):
+                        continue
                     # After a short genus ("sea" sounds like "Zea") the
                     # species must sound identical; after a near miss it
                     # must at least be long.
-                    if match[0] < 0.99 and (
+                    if near_epithet and (
                         short_genus
                         or (
                             near_genus
@@ -1126,12 +1196,20 @@ class SpeciesList:
             return best[2], -best[1], best[0]
 
         word = tokens[index].group()
-        if len(word) >= _LONE_GENUS_MIN_LETTERS and not word.isupper():
-            matches = self._match_genus(word)
+        min_letters = _LONE_GENUS_MIN_LETTERS
+        if word[0].isupper() and not _starts_sentence(text, tokens[index].start()):
+            # "Andrea" is more likely a person than the moss "Andreaea".
+            min_letters = _LONE_CAPITALIZED_GENUS_MIN_LETTERS
+        # Odd capitals ("LarryX", "CALIPSO") mark a name or an acronym.
+        if len(word) >= min_letters and (word.islower() or word.istitle()):
+            matches = [match for match in self._match_genus(word) if match[0] >= 0.99]
             if (
                 len(matches) == 1
-                and matches[0][0] >= 0.99
                 and matches[0][1][0] == word[0].lower()
+                # Only capitalizing would turn "a fuchsia color" into
+                # "a Fuchsia color", so a word already spelled right is left.
+                and matches[0][1] != word.lower()
+                and abs(len(matches[0][1]) - len(word)) <= 1
             ):
                 return self._genera[matches[0][1]], 1, 0.0
         return None
@@ -1149,7 +1227,9 @@ class SpeciesList:
                 # "is Mycena hematopis" can pass for a name split in two
                 # ("isMycena"); the name starting one word later fits better.
                 later = self._name_at(text, tokens, index + 1)
-                if later is not None and later[2] > found[2]:
+                joined = found[1] > len(found[0].split())
+                margin = _JOIN_MARGIN if joined else 0
+                if later is not None and later[2] > found[2] - margin:
                     found = None
             if found is None:
                 index += 1
