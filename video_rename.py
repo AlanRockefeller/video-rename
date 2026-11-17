@@ -753,6 +753,25 @@ _NOT_EPITHETS = frozenset(
     """.split()  # noqa: SIM905 - easier to read and edit as prose
 )
 _TRANSCRIPT_WORD_RE = re.compile(r"[A-Za-z][A-Za-z'-]*[A-Za-z]")
+# At the start of a sentence every word is capitalized, so "Strong flavor" or
+# "Gorgeous patina" would look like species.  There, a pair only counts when
+# the genus is also capitalized mid-sentence elsewhere, or the epithet has an
+# ending that is rare in everyday English.
+_STRONG_EPITHET_RE = re.compile(r"(?:us|um|ii|ae|ensis|oides|ata|ica|ia|(?<!s)is)$")
+
+
+def _starts_sentence(text, index):
+    """Return True if position index begins the text or a new sentence."""
+    before = text[:index].rstrip(" \t\n\"'“‘(")
+    return not before or before[-1] in ".!?"
+
+
+def _capitalized_mid_sentence(text, word):
+    """Return True if word appears capitalized somewhere not starting a sentence."""
+    return any(
+        not _starts_sentence(text, match.start())
+        for match in re.finditer(rf"\b{re.escape(word)}\b", text)
+    )
 
 
 def suggest_description(transcript, max_words=SUGGESTION_MAX_WORDS):
@@ -777,8 +796,15 @@ def suggest_description(transcript, max_words=SUGGESTION_MAX_WORDS):
         chosen.append(word)
         return True
 
-    for genus, epithet in _SPECIES_NAME_RE.findall(transcript):
+    for match in _SPECIES_NAME_RE.finditer(transcript):
+        genus, epithet = match.groups()
         if genus.lower() in _SUGGESTION_STOPWORDS or epithet in _NOT_EPITHETS:
+            continue
+        if (
+            _starts_sentence(transcript, match.start())
+            and not _STRONG_EPITHET_RE.search(epithet)
+            and not _capitalized_mid_sentence(transcript, genus)
+        ):
             continue
         if len(chosen) + 2 > max_words:
             break
@@ -821,10 +847,13 @@ def _file_fingerprint(file_path):
     with Path(file_path).open("rb") as source:
         size = os.fstat(source.fileno()).st_size
         digest.update(str(size).encode("ascii"))
-        digest.update(source.read(_FINGERPRINT_BYTES))
         if size > 2 * _FINGERPRINT_BYTES:
+            digest.update(source.read(_FINGERPRINT_BYTES))
             source.seek(size - _FINGERPRINT_BYTES)
             digest.update(source.read(_FINGERPRINT_BYTES))
+        else:
+            # Small files are hashed whole, so any change gives a new key.
+            digest.update(source.read())
     return digest.hexdigest()
 
 
@@ -916,7 +945,11 @@ class Transcriber:
         self.model_name = model_name
         self.prompt = prompt or None
         self._backend = backend
+        # _lock serializes transcription (one model run at a time); the
+        # cache has its own lock so a reviewer's correction never waits for
+        # another clip to finish transcribing.
         self._lock = threading.Lock()
+        self._cache_lock = threading.Lock()
         self._cache = None
 
     def _cache_prefix(self):
@@ -1025,9 +1058,10 @@ class Transcriber:
             return None
 
         with self._lock:
-            self._load_cache()
-            if key in self._cache:
-                return self._cache[key]
+            with self._cache_lock:
+                self._load_cache()
+                if key in self._cache:
+                    return self._cache[key]
             try:
                 backend = self._ensure_backend()
                 with tempfile.TemporaryDirectory(
@@ -1044,9 +1078,28 @@ class Transcriber:
                 print(f"Warning: Could not transcribe {Path(file_path).name}: {exc}")
                 return None
             text = re.sub(r"\s+", " ", text or "").strip()
-            self._cache[key] = text
-            self._save_cache()
+            with self._cache_lock:
+                self._cache[key] = text
+                self._save_cache()
             return text
+
+    def remember(self, file_path, text):
+        """Store a reviewer's corrected transcript in place of the heard one.
+
+        A cleared transcript is stored as "", so it is not heard again the
+        next time the clip is reviewed or catalogued.  Returns False if the
+        video could not be read.
+        """
+        try:
+            key = f"{self._cache_prefix()}:{_file_fingerprint(file_path)}"
+        except OSError as exc:
+            print(f"Warning: Could not read {Path(file_path).name}: {exc}")
+            return False
+        with self._cache_lock:
+            self._load_cache()
+            self._cache[key] = re.sub(r"\s+", " ", text or "").strip()
+            self._save_cache()
+        return True
 
 
 # --- Transcript files ---
@@ -1059,9 +1112,42 @@ MIN_TRANSCRIPT_WORDS = 15
 
 
 def transcript_file_path(video_path):
-    """Return the text file that holds a video's transcript, beside the video."""
+    """Return the text file that holds a video's transcript, beside the video.
+
+    The video's extension is kept (``IMG_1.mp4.txt``) so that videos sharing
+    a base name, such as ``IMG_1.mp4`` and ``IMG_1.mov``, never share a file.
+    """
     video_path = Path(video_path)
-    return video_path.with_name(f"{video_path.stem}.txt")
+    return video_path.with_name(f"{video_path.name}.txt")
+
+
+def _adopt_legacy_transcript(video_path):
+    """Rename an older ``IMG_1.txt`` transcript to ``IMG_1.mp4.txt``.
+
+    Earlier versions named the file after the video's stem only.  Such a file
+    is adopted only when it is unambiguous: this program wrote it, the new
+    name is free, and no other video in the folder has the same stem.
+    """
+    video_path = Path(video_path)
+    legacy_path = video_path.with_name(f"{video_path.stem}.txt")
+    new_path = transcript_file_path(video_path)
+    if not legacy_path.exists() or new_path.exists():
+        return
+    for extension in VIDEO_EXTENSIONS:
+        for suffix in (extension, extension.upper()):
+            sibling = video_path.with_suffix(suffix)
+            if (
+                suffix != video_path.suffix
+                and sibling.exists()
+                and not _same_file(sibling, video_path)
+            ):
+                return
+    if not _is_transcript_file(legacy_path):
+        return
+    try:
+        legacy_path.rename(new_path)
+    except OSError as exc:
+        print(f"Warning: Could not rename transcript {legacy_path.name}: {exc}")
 
 
 def _is_transcript_file(path):
@@ -1084,6 +1170,7 @@ def read_transcript_file(video_path):
     Returns (None, False) when there is no such file.  ``edited`` is True when
     the text was corrected by hand in the review screen.
     """
+    _adopt_legacy_transcript(video_path)
     path = transcript_file_path(video_path)
     if not _is_transcript_file(path):
         return None, False
@@ -1110,6 +1197,7 @@ def save_transcript_file(video_path, transcript, model_name=None, edited=False):
         return None
     if not edited and _transcript_word_count(transcript) < MIN_TRANSCRIPT_WORDS:
         return None
+    _adopt_legacy_transcript(video_path)
     path = transcript_file_path(video_path)
     if path.exists() and not _is_transcript_file(path):
         print(f"Warning: Not saving transcript; {path.name} already exists.")
@@ -1138,7 +1226,13 @@ def save_transcript_file(video_path, transcript, model_name=None, edited=False):
 
 
 def _move_transcript_file(old_video_path, new_video_path):
-    """Keep a saved transcript file paired with its video after a rename."""
+    """Keep a saved transcript file paired with its video after a rename.
+
+    Call this after the video itself has been renamed.
+    """
+    # An older-style IMG_1.txt is carried along only when no other video
+    # still uses that stem.
+    _adopt_legacy_transcript(old_video_path)
     old_path = transcript_file_path(old_video_path)
     new_path = transcript_file_path(new_video_path)
     if str(old_path) == str(new_path) or not _is_transcript_file(old_path):
@@ -1154,6 +1248,10 @@ def _move_transcript_file(old_video_path, new_video_path):
 
 class TrashUnavailableError(OSError):
     """Raised when no way to move a file to the Trash is available."""
+
+
+# Long enough to answer macOS's one-time "control Finder" permission prompt.
+TRASH_TIMEOUT_SECONDS = 120
 
 
 def move_to_trash(path):
@@ -1186,12 +1284,20 @@ def move_to_trash(path):
             "(POSIX file (item 1 of argv) as alias)\n"
             "end run"
         )
-        result = subprocess.run(
-            ["osascript", "-e", script, str(path.resolve())],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
+        try:
+            result = subprocess.run(
+                ["osascript", "-e", script, str(path.resolve())],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=TRASH_TIMEOUT_SECONDS,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise TrashUnavailableError(
+                "Finder did not answer, so the file was not moved to the Trash."
+                " If macOS is asking whether Terminal may control Finder,"
+                " allow it and try again."
+            ) from exc
         if result.returncode == 0:
             return
         raise TrashUnavailableError(
@@ -1221,6 +1327,7 @@ def move_to_trash(path):
 
 def _remove_transcript_file(video_path):
     """Move a saved transcript file to the Trash along with its video."""
+    _adopt_legacy_transcript(video_path)
     path = transcript_file_path(video_path)
     if _is_transcript_file(path):
         try:
@@ -1322,6 +1429,20 @@ def build_catalog_row(
     return row
 
 
+_FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
+
+
+def _spreadsheet_safe(value):
+    """Stop text such as a filename "=1+1.mp4" being run as a formula.
+
+    Spreadsheets treat a cell starting with = + - @ as a formula even inside
+    CSV quotes, so such text gets a leading apostrophe.  Numbers are kept.
+    """
+    if isinstance(value, str) and value.startswith(_FORMULA_PREFIXES):
+        return "'" + value
+    return value
+
+
 def write_catalog(
     video_files,
     output_path,
@@ -1357,7 +1478,9 @@ def write_catalog(
             )
         except TranscriberUnavailable:
             raise
-        except Exception as exc:  # pylint: disable=broad-exception-caught  # one bad file must not stop a run
+        except (
+            Exception
+        ) as exc:  # pylint: disable=broad-exception-caught  # one bad file must not stop a run
             print(f"Warning: Could not catalog {file_path.name}: {exc}")
             if debug:
                 raise
@@ -1369,7 +1492,10 @@ def write_catalog(
     with temporary_path.open("w", newline="", encoding="utf-8-sig") as handle:
         writer = csv.DictWriter(handle, fieldnames=fields, extrasaction="ignore")
         writer.writeheader()
-        writer.writerows(rows)
+        writer.writerows(
+            {key: _spreadsheet_safe(value) for key, value in row.items()}
+            for row in rows
+        )
     temporary_path.replace(output_path)
     return len(rows)
 
@@ -1476,6 +1602,8 @@ let scanned = 0, total = 0, itemOffset = 0, stopped = false, pollTimer = null, l
 let transcriptsEnabled = false, transcriptTimer = null, saveTranscripts = false;
 // The clip whose transcript is in the edit box, and whether it has unsaved edits.
 let transcriptItem = null, transcriptDirty = false;
+// Saves run one after another, so an older edit can never land after a newer one.
+let transcriptSave = Promise.resolve();
 const defaultPlaceholder = 'What happens in this video?';
 function cleanDescription(value) {
   return value.trim().replace(/[<>:"/\\|?*\x00-\x1f]/g, ' ')
@@ -1504,6 +1632,7 @@ async function ensureLocation(item) {
   if (!item.has_coordinates || item.locationResolved) return;
   if (!item.locationPromise) {
     const previousDescription = item.description || '';
+    const previousBroll = Boolean(item.broll);
     item.locationAttempted = true;
     item.locationPromise = fetch('/api/geocode', {method:'POST', headers:{'Content-Type':'application/json'},
       body:JSON.stringify({id:item.id})})
@@ -1521,6 +1650,8 @@ async function ensureLocation(item) {
           if (input.value === previousDescription) {
             input.value = item.description || '';
             if (document.activeElement === input) input.select();
+            // The lookup may also find a "broll" tag behind the location.
+            if ($('broll').checked === previousBroll) $('broll').checked = Boolean(item.broll);
           }
           $('proposed').textContent = proposedName(item, input.value);
         }
@@ -1569,7 +1700,13 @@ function showTranscriptStatus(info, note) {
   let text;
   if (note) text = note;
   else if (dryRun) text = 'Practice mode: you can edit this, but no transcript file is saved.';
-  else if (!saveTranscripts) text = 'You can edit this; edits only last until you finish.';
+  else if (info.edited && info.saved === false) {
+    text = 'Your correction could not be saved to a file (another text file may already have this name). It is kept until you finish.';
+  }
+  else if (!saveTranscripts) {
+    text = info.edited ? 'Your correction is remembered for next time.'
+      : 'You can edit this; your correction is remembered for next time.';
+  }
   else if (info.edited && info.transcript) text = 'Your corrected transcript is saved next to the clip.';
   else if (info.edited) text = 'Transcript cleared: no transcript file for this clip.';
   else if (info.word_count < info.min_words) {
@@ -1579,12 +1716,18 @@ function showTranscriptStatus(info, note) {
   } else text = 'Fix any mistakes here; your changes save when you click away.';
   $('transcript-status').textContent = text;
 }
-// Send the edit box's text to the server if it changed.  The clip is captured
-// first, so moving on to the next video right away is safe.
-async function flushTranscript() {
-  if (!transcriptDirty || !transcriptItem) return;
-  const item = transcriptItem, text = $('transcript').value;
-  transcriptDirty = false;
+// Queue the edit box's text to be saved if it changed, and return a promise
+// for every save so far (Finish waits on it).  The clip is captured first, so
+// moving on to the next video right away is safe.
+function flushTranscript() {
+  if (transcriptDirty && transcriptItem) {
+    const item = transcriptItem, text = $('transcript').value;
+    transcriptDirty = false;
+    transcriptSave = transcriptSave.then(() => sendTranscript(item, text));
+  }
+  return transcriptSave;
+}
+async function sendTranscript(item, text) {
   const onScreen = () => position < items.length && items[position].id === item.id;
   try {
     const response = await fetch('/api/transcript', {method:'POST', headers:{'Content-Type':'application/json'},
@@ -2086,21 +2229,35 @@ def _delete_review_item(server, item):
     with server.preview_locks_lock:
         item_lock = server.preview_locks.setdefault(item["id"], threading.Lock())
 
-    with item_lock, server.rename_lock, server.review_lock:
-        if item.get("deleted"):
-            raise ValueError("This video has already been deleted.")
-        source_path = item["path"]
-        if not server.dry_run:
-            try:
-                move_to_trash(source_path)
-            except FileNotFoundError as exc:
-                raise ValueError(f"Video no longer exists: {source_path.name}") from exc
-            except OSError as exc:
-                raise ValueError(str(exc)) from exc
-            _remove_transcript_file(source_path)
-        item["deleted"] = True
+    # The item and rename locks stop a rename racing the delete.  The review
+    # lock is released while Finder works, which can wait on a macOS
+    # permission prompt, so the scanner, transcriber and page keep running.
+    with item_lock, server.rename_lock:
+        with server.review_lock:
+            if item.get("deleted") or item.get("deleting"):
+                raise ValueError("This video has already been deleted.")
+            source_path = item["path"]
+            item["deleting"] = True
+        try:
+            if not server.dry_run:
+                try:
+                    move_to_trash(source_path)
+                except FileNotFoundError as exc:
+                    raise ValueError(
+                        f"Video no longer exists: {source_path.name}"
+                    ) from exc
+                except OSError as exc:
+                    raise ValueError(str(exc)) from exc
+                _remove_transcript_file(source_path)
+        except BaseException:
+            with server.review_lock:
+                item.pop("deleting", None)
+            raise
 
-        preview_path = item.pop("browser_preview_path", None)
+        with server.review_lock:
+            item["deleted"] = True
+            item.pop("deleting", None)
+            preview_path = item.pop("browser_preview_path", None)
         if preview_path:
             try:
                 preview_path.unlink()
@@ -2428,26 +2585,37 @@ def _save_edited_transcript(server, item, transcript):
         raise ValueError("Transcription is not turned on.")
     transcript = transcript.strip()
     entry = _transcript_entry(transcript, edited=True)
-    with server.rename_lock, server.review_lock:
-        if item.get("deleted"):
-            raise ValueError("This video has been deleted.")
-        server.transcripts[item["id"]] = entry
-        entry = dict(entry)
-        entry["saved"] = False
-        if getattr(server, "save_transcripts", False) and not server.dry_run:
-            if transcript:
-                entry["saved"] = bool(
-                    save_transcript_file(
-                        item["path"],
-                        transcript,
-                        server.transcriber.model_name,
-                        edited=True,
+    with server.rename_lock:
+        with server.review_lock:
+            if item.get("deleted") or item.get("deleting"):
+                raise ValueError("This video has been deleted.")
+            path = item["path"]
+        remembered = saved = False
+        if not server.dry_run:
+            # The cache keeps the correction (or the clearing) even without
+            # transcript files, so the clip is not heard again next time.
+            remembered = server.transcriber.remember(path, transcript)
+            if getattr(server, "save_transcripts", False):
+                if transcript:
+                    saved = bool(
+                        save_transcript_file(
+                            path,
+                            transcript,
+                            server.transcriber.model_name,
+                            edited=True,
+                        )
                     )
-                )
+                else:
+                    # An emptied transcript means the clip has nothing worth
+                    # keeping.
+                    _remove_transcript_file(path)
+                    saved = not transcript_file_path(path).exists()
             else:
-                # An emptied transcript means the clip has nothing worth keeping.
-                _remove_transcript_file(item["path"])
-    return entry
+                saved = remembered
+        entry["saved"] = saved
+        with server.review_lock:
+            server.transcripts[item["id"]] = entry
+    return dict(entry)
 
 
 def _next_transcript_item(server):
@@ -2457,7 +2625,9 @@ def _next_transcript_item(server):
         candidates = [
             item
             for item in server.review_items
-            if not item.get("deleted") and item["id"] not in server.transcripts
+            if not item.get("deleted")
+            and not item.get("deleting")
+            and item["id"] not in server.transcripts
         ]
         for item in candidates:
             if item["id"] == priority:
@@ -2476,25 +2646,31 @@ def _next_transcript_item(server):
 def _transcribe_review_items(server):
     """Transcribe review items in the background while the reviewer works."""
     while not server.stop_event.is_set():
+        with server.review_lock:
+            # Read this before choosing, so an item the scanner adds just
+            # before finishing is still picked up on the next pass.
+            scan_complete = server.scan_complete
         item, path = _next_transcript_item(server)
         if item is None:
-            with server.review_lock:
-                scanning = not server.scan_complete
-            if not scanning:
+            if scan_complete:
                 return
             server.stop_event.wait(0.5)
             continue
         edited_text, edited = read_transcript_file(path)
         try:
-            transcript = (
-                edited_text if edited else server.transcriber.transcript(path)
-            )
+            transcript = edited_text if edited else server.transcriber.transcript(path)
         except TranscriberUnavailable as exc:
             print(f"Warning: Transcription stopped: {exc}")
             with server.review_lock:
                 server.transcription_failed = True
             return
         if transcript is None:
+            with server.review_lock:
+                renamed = item["path"] != path and not item.get("deleted")
+            if renamed:
+                # The reviewer renamed the video while it was being read;
+                # try again under its new name.
+                continue
             entry = {"status": "unavailable"}
         else:
             entry = _transcript_entry(transcript, edited)
@@ -2765,7 +2941,7 @@ Examples:
         "--save-transcripts",
         action="store_true",
         help="With --transcribe, also save each transcript as a text file next\n"
-        "to its video (same name, .txt), so it can be searched with tools\n"
+        "to its video (IMG_1.mp4 -> IMG_1.mp4.txt), so it can be searched with tools\n"
         "such as Spotlight. The text file is renamed along with the video.",
     )
     parser.add_argument(
@@ -2794,6 +2970,8 @@ Examples:
         parser.error("--include-described can only be used with --interactive")
     if args.catalog and args.interactive:
         parser.error("--catalog cannot be combined with --interactive")
+    if args.catalog and args.dry_run:
+        parser.error("--dry-run cannot be combined with --catalog")
     if args.transcribe and not (args.interactive or args.catalog):
         parser.error("--transcribe can only be used with --interactive or --catalog")
     if args.save_transcripts and not args.transcribe:

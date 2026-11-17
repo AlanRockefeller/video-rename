@@ -8,22 +8,12 @@ commit date rather than release tag; the `v1.2` tag covers the 2026-10-24 and
 
 ### Added
 
-- The transcript in the review screen is now editable. Corrections are saved
-  to the transcript file (marked "Edited by hand"), update the suggested
-  description, and are never overwritten by automatic transcription.
-- Added a **B-roll** checkbox (`Ctrl+B`) to the review screen that adds a
-  `broll` tag after the description in the new name, and a `b_roll` column to
-  the catalog.
-
-### Changed
-
-- Transcript files are no longer saved for clips with fewer than 15 spoken
-  words, unless the transcript was edited by hand.
-
 - Added `--catalog CSV_FILE`, which writes a spreadsheet of every video
-  (description, date, location, orientation, duration, resolution and size)
-  without renaming anything. The CSV includes a UTF-8 byte-order mark so
-  Excel shows accented place and species names correctly.
+  (description, b-roll, date, location, orientation, duration, resolution and
+  size) without renaming anything. The CSV includes a UTF-8 byte-order mark so
+  Excel shows accented place and species names correctly, and text that a
+  spreadsheet would run as a formula (such as a filename starting with `=`)
+  is prefixed with an apostrophe.
 - Added `--transcribe` for local speech transcription with faster-whisper or
   openai-whisper. In interactive mode, a **Heard in this clip** panel shows
   the transcript and a suggested description, used only when the reviewer
@@ -33,20 +23,35 @@ commit date rather than release tag; the `v1.2` tag covers the 2026-10-24 and
 - Transcripts are cached by file content and model, so renaming a video does
   not cause it to be transcribed again.
 - Added `--save-transcripts`, which also saves each transcript as a text file
-  next to its video (same name, `.txt`) so it can be found with desktop search
-  such as Spotlight. The text file is renamed along with its video and removed
-  if the video is deleted in the review screen. Text files the program did not
-  write are never overwritten, moved or deleted.
+  next to its video, named after the whole video filename (`IMG_1.mp4.txt`),
+  so it can be found with desktop search such as Spotlight. The text file is
+  renamed along with its video and moved to the Trash if the video is deleted
+  in the review screen. Text files the program did not write are never
+  overwritten, moved or deleted.
 - Added `--vocabulary TEXT_FILE`, a list of names and terms (one per line)
   given to Whisper as a prompt so species and people's names are spelled
   consistently. Transcripts are cached separately for each word list.
+- The transcript in the review screen is editable. A correction updates the
+  suggested description, is remembered in the transcript cache (a cleared
+  transcript stays cleared), and with `--save-transcripts` is saved to the
+  transcript file marked "Edited by hand", which automatic transcription
+  never overwrites. The page reports when a correction could not be saved and
+  waits for pending saves before finishing.
+- Added a **B-roll** checkbox (`Ctrl+B`) to the review screen that adds a
+  `broll` tag after the description in the new name, and a `b_roll` column to
+  the catalog.
 
 ### Changed
 
 - **Delete…** in the review screen now moves the video (and its saved
   transcript) to the Trash instead of deleting it permanently. It uses
   send2trash when installed, otherwise Finder on macOS or `gio trash` on
-  Linux, and refuses to delete if no Trash is available.
+  Linux, and refuses to delete if no Trash is available. The review page keeps
+  working while Finder asks for permission, and Finder is given two minutes
+  to answer.
+- Transcript files are no longer saved for clips with fewer than 15 spoken
+  words, unless the transcript was edited by hand.
+- `--dry-run` cannot be combined with `--catalog`, which always writes files.
 
 ## 2026-11-08
 

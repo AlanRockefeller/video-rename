@@ -1629,6 +1629,10 @@ class TestCatalogArguments:
         "extra, message",
         [
             (["--catalog", "c.csv", "--interactive"], "cannot be combined"),
+            (
+                ["--catalog", "c.csv", "--dry-run"],
+                "--dry-run cannot be combined with --catalog",
+            ),
             (["--transcribe"], "--transcribe can only be used"),
         ],
     )
@@ -1684,7 +1688,7 @@ class TestTranscriptFiles:
             video, "Look at this Amanita muscaria", "/models/small.en"
         )
 
-        assert path == tmp_path / "IMG_0001.txt"
+        assert path == tmp_path / "IMG_0001.mov.txt"
         text = path.read_text(encoding="utf-8")
         assert text.startswith(video_rename.TRANSCRIPT_FILE_MARKER + "\n")
         assert "Speech model: small.en." in text
@@ -1696,10 +1700,10 @@ class TestTranscriptFiles:
         video = tmp_path / "IMG_0002.mov"
 
         assert video_rename.save_transcript_file(video, "") is None
-        assert not (tmp_path / "IMG_0002.txt").exists()
+        assert not (tmp_path / "IMG_0002.mov.txt").exists()
 
     def test_never_overwrites_someone_elses_text_file(self, tmp_path, capsys):
-        notes = tmp_path / "IMG_0003.txt"
+        notes = tmp_path / "IMG_0003.mov.txt"
         notes.write_text("my field notes", encoding="utf-8")
 
         result = video_rename.save_transcript_file(tmp_path / "IMG_0003.mov", "hi")
@@ -1715,7 +1719,7 @@ class TestTranscriptFiles:
         video_rename.save_transcript_file(video, "second")
 
         assert (
-            (tmp_path / "IMG_0004.txt")
+            (tmp_path / "IMG_0004.mov.txt")
             .read_text(encoding="utf-8")
             .endswith("\nsecond\n")
         )
@@ -1727,14 +1731,14 @@ class TestTranscriptFiles:
 
         video_rename._move_transcript_file(old, new)
 
-        assert not (tmp_path / "IMG_0005.txt").exists()
-        assert (tmp_path / "IMG_0005_puffballs.txt").exists()
+        assert not (tmp_path / "IMG_0005.mov.txt").exists()
+        assert (tmp_path / "IMG_0005_puffballs.mov.txt").exists()
 
         other_old = tmp_path / "IMG_0006.mov"
-        (tmp_path / "IMG_0006.txt").write_text("not ours", encoding="utf-8")
+        (tmp_path / "IMG_0006.mov.txt").write_text("not ours", encoding="utf-8")
         video_rename._move_transcript_file(other_old, tmp_path / "IMG_0006_x.mov")
-        assert (tmp_path / "IMG_0006.txt").exists()
-        assert not (tmp_path / "IMG_0006_x.txt").exists()
+        assert (tmp_path / "IMG_0006.mov.txt").exists()
+        assert not (tmp_path / "IMG_0006_x.mov.txt").exists()
 
     def test_interactive_rename_carries_the_transcript(self, tmp_path):
         old = tmp_path / "IMG_1234_horizontal.mp4"
@@ -1746,7 +1750,7 @@ class TestTranscriptFiles:
         handler._rename(item, "Beach")
 
         assert transcript_text(item["path"]).endswith("\na lovely beach\n")
-        assert not (tmp_path / "IMG_1234_horizontal.txt").exists()
+        assert not (tmp_path / "IMG_1234_horizontal.mp4.txt").exists()
 
     def test_deleting_a_video_removes_its_transcript(self, tmp_path, fake_trash):
         video = tmp_path / "delete-me.mp4"
@@ -1757,8 +1761,8 @@ class TestTranscriptFiles:
             TestInteractiveDelete._server(False), {"id": 0, "path": video}
         )
 
-        assert not (tmp_path / "delete-me.txt").exists()
-        assert (fake_trash / "delete-me.txt").exists()
+        assert not (tmp_path / "delete-me.mp4.txt").exists()
+        assert (fake_trash / "delete-me.mp4.txt").exists()
 
     def test_review_saves_transcripts_under_the_current_name(self, tmp_path):
         old = tmp_path / "IMG_7.mp4"
@@ -1779,7 +1783,7 @@ class TestTranscriptFiles:
         video_rename._transcribe_review_items(server)
 
         assert transcript_text(renamed).endswith("\nso many moths\n")
-        assert not (tmp_path / "IMG_7.txt").exists()
+        assert not (tmp_path / "IMG_7.mp4.txt").exists()
 
     def test_review_dry_run_writes_nothing(self, tmp_path):
         server = TestInteractiveTranscripts._server(items=1)
@@ -1831,7 +1835,7 @@ class TestTranscriptWordMinimum:
         video = tmp_path / "IMG_0100.mov"
 
         assert video_rename.save_transcript_file(video, "wind and a bird") is None
-        assert not (tmp_path / "IMG_0100.txt").exists()
+        assert not (tmp_path / "IMG_0100.mov.txt").exists()
 
     def test_fifteen_words_are_saved(self, tmp_path):
         video = tmp_path / "IMG_0101.mov"
@@ -1856,11 +1860,13 @@ class TestTranscriptWordMinimum:
         transcriber.transcript.return_value = "birds singing"
 
         video_rename.write_catalog(
-            [video], tmp_path / "clips.csv", transcriber=transcriber,
+            [video],
+            tmp_path / "clips.csv",
+            transcriber=transcriber,
             save_transcripts=True,
         )
 
-        assert not (tmp_path / "IMG_0103.txt").exists()
+        assert not (tmp_path / "IMG_0103.mp4.txt").exists()
 
 
 class TestEditedTranscripts:
@@ -1930,8 +1936,8 @@ class TestEditedTranscripts:
 
         video_rename._save_edited_transcript(server, server.review_items[0], "  ")
 
-        assert not (tmp_path / "IMG_0204.txt").exists()
-        assert (fake_trash / "IMG_0204.txt").exists()
+        assert not (tmp_path / "IMG_0204.mp4.txt").exists()
+        assert (fake_trash / "IMG_0204.mp4.txt").exists()
 
     def test_edit_must_be_text(self, tmp_path):
         server = self._server(tmp_path / "IMG_0205.mp4")
@@ -1961,15 +1967,25 @@ class TestBroll:
 
     def test_name_gets_broll_after_the_description(self, tmp_path):
         path = _build_descriptive_path(
-            tmp_path / "IMG_1.mp4", "forest floor", "2026-11-16", "USA_CA",
-            "horizontal", "IMG_1", broll=True,
+            tmp_path / "IMG_1.mp4",
+            "forest floor",
+            "2026-11-16",
+            "USA_CA",
+            "horizontal",
+            "IMG_1",
+            broll=True,
         )
         assert path.name == "IMG_1_forest_floor_broll_2026-11-16_USA_CA_horizontal.mp4"
 
     def test_broll_typed_in_description_is_not_doubled(self, tmp_path):
         path = _build_descriptive_path(
-            tmp_path / "IMG_1.mp4", "forest broll", None, None, "vertical",
-            "IMG_1", broll=True,
+            tmp_path / "IMG_1.mp4",
+            "forest broll",
+            None,
+            None,
+            "vertical",
+            "IMG_1",
+            broll=True,
         )
         assert path.name == "IMG_1_forest_broll_vertical.mp4"
 
@@ -2006,6 +2022,290 @@ class TestBroll:
 
     def test_review_page_has_a_broll_checkbox(self):
         assert 'type="checkbox" id="broll"' in _INTERACTIVE_HTML
+
+
+class TestSameStemVideos:
+    def test_each_video_gets_its_own_transcript_file(self, tmp_path):
+        mp4, mov = tmp_path / "IMG_1.mp4", tmp_path / "IMG_1.mov"
+        video_rename.save_transcript_file(mp4, "mp4 narration " + "word " * 20, "base")
+        video_rename.save_transcript_file(mov, "mov narration " + "word " * 20, "base")
+
+        assert "mp4 narration" in transcript_text(mp4)
+        assert "mov narration" in transcript_text(mov)
+        assert not (tmp_path / "IMG_1.txt").exists()
+
+    def test_renaming_or_deleting_one_leaves_the_other(self, tmp_path, fake_trash):
+        mp4, mov = tmp_path / "IMG_1.mp4", tmp_path / "IMG_1.mov"
+        for video in (mp4, mov):
+            video.write_bytes(b"v")
+            video_rename.save_transcript_file(video, LONG_TRANSCRIPT)
+        renamed = tmp_path / "IMG_1_moss.mp4"
+        mp4.rename(renamed)
+
+        video_rename._move_transcript_file(mp4, renamed)
+        video_rename._remove_transcript_file(renamed)
+
+        assert (tmp_path / "IMG_1.mov.txt").exists()
+        assert (fake_trash / "IMG_1_moss.mp4.txt").exists()
+
+
+class TestOlderTranscriptFiles:
+    """Files saved as IMG_1.txt by earlier versions are adopted when unambiguous."""
+
+    @staticmethod
+    def _legacy(tmp_path, stem="IMG_1"):
+        path = tmp_path / f"{stem}.txt"
+        path.write_text(
+            f"{video_rename.TRANSCRIPT_FILE_MARKER}\n\nold words\n", encoding="utf-8"
+        )
+        return path
+
+    def test_adopted_when_only_one_video_has_the_stem(self, tmp_path):
+        video = tmp_path / "IMG_1.mp4"
+        video.write_bytes(b"v")
+        self._legacy(tmp_path)
+
+        assert video_rename.read_transcript_file(video) == ("old words", False)
+        assert (tmp_path / "IMG_1.mp4.txt").exists()
+        assert not (tmp_path / "IMG_1.txt").exists()
+
+    def test_left_alone_when_two_videos_share_the_stem(self, tmp_path):
+        for name in ("IMG_1.mp4", "IMG_1.mov"):
+            (tmp_path / name).write_bytes(b"v")
+        legacy = self._legacy(tmp_path)
+
+        assert video_rename.read_transcript_file(tmp_path / "IMG_1.mp4") == (
+            None,
+            False,
+        )
+        assert legacy.exists()
+
+    def test_someone_elses_text_file_is_never_adopted(self, tmp_path):
+        video = tmp_path / "IMG_1.mp4"
+        video.write_bytes(b"v")
+        notes = tmp_path / "IMG_1.txt"
+        notes.write_text("my field notes", encoding="utf-8")
+
+        video_rename.save_transcript_file(video, LONG_TRANSCRIPT)
+
+        assert notes.read_text(encoding="utf-8") == "my field notes"
+        assert (tmp_path / "IMG_1.mp4.txt").exists()
+
+    def test_rename_carries_an_older_file(self, tmp_path):
+        old, new = tmp_path / "IMG_1.mp4", tmp_path / "IMG_1_moss.mp4"
+        new.write_bytes(b"v")  # already renamed
+        self._legacy(tmp_path)
+
+        video_rename._move_transcript_file(old, new)
+
+        assert (tmp_path / "IMG_1_moss.mp4.txt").exists()
+        assert not (tmp_path / "IMG_1.txt").exists()
+
+
+class TestSpeciesSuggestions:
+    @pytest.mark.parametrize(
+        "transcript, expected",
+        [
+            (
+                "Beautiful color on this one, Amanita muscaria growing here.",
+                "Amanita muscaria beautiful color growing",
+            ),
+            (
+                "Strong flavor. Gorgeous patina on the cap.",
+                "strong flavor gorgeous patina",
+            ),
+            ("Mycena haematopus", "Mycena haematopus"),
+            ("Boletus edulis here.", "Boletus edulis"),
+            ("Trametes versicolor here. I love Trametes.", "Trametes versicolor love"),
+            ("Look at this Trametes versicolor on the log.", "Trametes versicolor"),
+        ],
+    )
+    def test_sentence_start_false_positives(self, transcript, expected):
+        assert video_rename.suggest_description(transcript) == expected
+
+
+class TestFingerprint:
+    def test_small_files_differing_late_get_different_keys(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(video_rename, "_FINGERPRINT_BYTES", 4)
+        first, second = tmp_path / "a.mp4", tmp_path / "b.mp4"
+        first.write_bytes(b"aaaa" + b"bbb1")
+        second.write_bytes(b"aaaa" + b"bbb2")
+
+        assert video_rename._file_fingerprint(first) != video_rename._file_fingerprint(
+            second
+        )
+
+
+class TestCatalogSpreadsheetSafety:
+    @pytest.mark.parametrize("value", ["=1+1", "+cmd", "-2", "@SUM(A1)"])
+    def test_formula_text_is_neutralized(self, value):
+        assert video_rename._spreadsheet_safe(value) == "'" + value
+
+    def test_numbers_and_plain_text_are_kept(self):
+        assert video_rename._spreadsheet_safe(-2.5) == -2.5
+        assert video_rename._spreadsheet_safe("moss") == "moss"
+
+    @patch("video_rename.get_location_info", return_value=None)
+    @patch("video_rename.get_exif_data", return_value={})
+    def test_catalog_file_is_safe(self, _exif, _location, tmp_path):
+        video = tmp_path / "=1+1.mp4"
+        video.write_bytes(b"a")
+        output = tmp_path / "clips.csv"
+
+        video_rename.write_catalog([video], output)
+
+        assert "'=1+1.mp4" in output.read_text(encoding="utf-8-sig")
+
+
+class TestDeleteDoesNotFreezeTheReview:
+    def test_review_lock_is_free_while_trashing(self, tmp_path, monkeypatch):
+        video = tmp_path / "clip.mp4"
+        video.write_bytes(b"v")
+        server = TestInteractiveDelete._server(False)
+        lock_free = []
+
+        def fake_move_to_trash(path):
+            acquired = server.review_lock.acquire(blocking=False)
+            lock_free.append(acquired)
+            if acquired:
+                server.review_lock.release()
+
+        monkeypatch.setattr(video_rename, "move_to_trash", fake_move_to_trash)
+        item = {"id": 0, "path": video}
+
+        _delete_review_item(server, item)
+
+        assert lock_free == [True]
+        assert item["deleted"] is True and "deleting" not in item
+
+    def test_failed_trash_leaves_the_item_reviewable(self, tmp_path, monkeypatch):
+        def refuse(_path):
+            raise video_rename.TrashUnavailableError("no Trash")
+
+        monkeypatch.setattr(video_rename, "move_to_trash", refuse)
+        item = {"id": 0, "path": tmp_path / "clip.mp4"}
+
+        with pytest.raises(ValueError, match="no Trash"):
+            _delete_review_item(TestInteractiveDelete._server(False), item)
+
+        assert "deleted" not in item and "deleting" not in item
+
+    def test_finder_timeout_is_reported(self, tmp_path, monkeypatch):
+        video = tmp_path / "clip.mp4"
+        video.write_bytes(b"v")
+        monkeypatch.setitem(sys.modules, "send2trash", None)
+        monkeypatch.setattr(video_rename.sys, "platform", "darwin")
+        monkeypatch.setattr(video_rename.shutil, "which", lambda name: name)
+
+        def hang(command, **kwargs):
+            assert kwargs["timeout"] == video_rename.TRASH_TIMEOUT_SECONDS
+            raise subprocess.TimeoutExpired(command, kwargs["timeout"])
+
+        monkeypatch.setattr(video_rename.subprocess, "run", hang)
+
+        with pytest.raises(video_rename.TrashUnavailableError, match="did not answer"):
+            video_rename.move_to_trash(video)
+        assert video.exists()
+
+
+class TestRememberedCorrections:
+    @pytest.fixture
+    def video(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+        video = tmp_path / "IMG_1.mp4"
+        video.write_bytes(b"video")
+        return video
+
+    def test_cleared_transcript_stays_cleared(self, video):
+        backend = MagicMock(return_value="Thank you for watching")
+        with patch.object(
+            video_rename.Transcriber, "_extract_audio", return_value=True
+        ):
+            first = video_rename.Transcriber("base", backend=backend)
+            assert first.transcript(video) == "Thank you for watching"
+            first.remember(video, "")
+
+            again = video_rename.Transcriber("base", backend=backend)
+            assert again.transcript(video) == ""
+        assert backend.call_count == 1
+
+    def test_correction_is_remembered_without_transcript_files(self, video):
+        server = TestEditedTranscripts()._server(video)
+        server.save_transcripts = False
+        server.transcriber = video_rename.Transcriber("base", backend=MagicMock())
+
+        entry = video_rename._save_edited_transcript(
+            server, server.review_items[0], "Mycena leaiana"
+        )
+
+        assert entry["saved"] is True
+        assert server.transcriber.transcript(video) == "Mycena leaiana"
+        assert not transcript_file_exists(video)
+
+    def test_save_failure_is_reported(self, video):
+        (video.parent / "IMG_1.mp4.txt").write_text("my notes", encoding="utf-8")
+        server = TestEditedTranscripts()._server(video)
+
+        entry = video_rename._save_edited_transcript(
+            server, server.review_items[0], "Mycena leaiana"
+        )
+
+        assert entry["saved"] is False
+        assert server.transcripts[0]["saved"] is False
+
+
+class TestTranscriberWorkerRaces:
+    def test_retries_a_video_renamed_while_it_was_read(self):
+        server = TestInteractiveTranscripts._server(items=1)
+        renamed = Path("IMG_0_moss.mp4")
+
+        def transcribe(path):
+            if path != renamed:
+                server.review_items[0]["path"] = renamed
+                return None
+            return "moss on a log"
+
+        server.transcriber = MagicMock()
+        server.transcriber.transcript.side_effect = transcribe
+
+        video_rename._transcribe_review_items(server)
+
+        assert server.transcripts[0]["transcript"] == "moss on a log"
+
+    def test_item_added_as_the_scan_finishes_is_transcribed(self, monkeypatch):
+        server = TestInteractiveTranscripts._server(items=0, scan_complete=False)
+        server.transcriber = MagicMock()
+        server.transcriber.transcript.return_value = "late clip"
+        real_next = video_rename._next_transcript_item
+        calls = []
+
+        def next_item(srv):
+            calls.append(1)
+            if len(calls) == 1:
+                # The scanner adds its last item and finishes in between.
+                srv.review_items.append({"id": 0, "path": Path("IMG_9.mp4")})
+                srv.scan_complete = True
+                return None, None
+            return real_next(srv)
+
+        monkeypatch.setattr(video_rename, "_next_transcript_item", next_item)
+        server.stop_event.wait = lambda _seconds: None
+
+        video_rename._transcribe_review_items(server)
+
+        assert server.transcripts[0]["transcript"] == "late clip"
+
+
+class TestReviewPageSaving:
+    def test_finish_waits_for_queued_saves(self):
+        assert "transcriptSave = transcriptSave.then" in _INTERACTIVE_HTML
+
+    def test_geocoding_restores_the_broll_tick(self):
+        assert "previousBroll" in _INTERACTIVE_HTML
+
+
+def transcript_file_exists(video):
+    return video_rename.transcript_file_path(video).exists()
 
 
 def transcript_text(video):

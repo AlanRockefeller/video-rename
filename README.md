@@ -119,8 +119,12 @@ are keyed by file content and model, so renamed videos are not transcribed
 again.
 
 Add `--save-transcripts` to also keep each transcript in a text file beside
-its video, with the same name and a `.txt` extension (for example
-`IMG_6426_amanita_2023-12-09_vertical.txt`). These files can be searched with
+its video, named after the whole video filename plus `.txt` (for example
+`IMG_6426_amanita_2023-12-09_vertical.mp4.txt`), so videos that share a base
+name such as `IMG_1.mp4` and `IMG_1.mov` never share a transcript. A file
+saved by an earlier version as `IMG_1.txt` is renamed to the new style the
+next time its video is reviewed or catalogued, unless another video in the
+folder has the same base name. These files can be searched with
 Spotlight or any desktop search, and they stay paired with their video: when a
 video is renamed, its transcript file is renamed too, and deleting a video in
 the review screen moves its transcript file to the Trash with it. Clips with
@@ -129,7 +133,9 @@ file the program did not write is never overwritten, moved or deleted. A
 transcript corrected in the review screen is saved even when it is short, is
 marked "Edited by hand", and is never replaced by a fresh automatic
 transcript; it is also what the catalog uses. Emptying the box moves the
-transcript file to the Trash.
+transcript file to the Trash. Corrections, including an emptied transcript,
+are also remembered in `transcripts.json`, so a clip is not heard again with
+its old mistakes, even without `--save-transcripts`.
 
 Add `--vocabulary words.txt` to help Whisper spell names it would otherwise
 guess at, such as species, places and people. The file has one term per line;
@@ -209,9 +215,9 @@ python3 video_rename.py [PATHS...] [OPTIONS]
 -   `--dry-run`: Print the proposed renames without actually changing any files. This is highly recommended for the first run.
 -   `-i`, `--interactive`: Open the video review screen and add descriptions.
 -   `--include-described`: Also show videos that already appear to have a description (interactive mode only).
--   `--catalog CSV_FILE`: Write a spreadsheet listing every video instead of renaming. Cannot be combined with `--interactive`.
+-   `--catalog CSV_FILE`: Write a spreadsheet listing every video instead of renaming. Cannot be combined with `--interactive` or `--dry-run`.
 -   `--transcribe`: Transcribe speech locally to suggest descriptions (`--interactive`) or add transcript columns (`--catalog`).
--   `--save-transcripts`: With `--transcribe`, also save each transcript as a searchable `.txt` file beside its video.
+-   `--save-transcripts`: With `--transcribe`, also save each transcript as a searchable text file beside its video (`IMG_1.mp4` → `IMG_1.mp4.txt`).
 -   `--whisper-model NAME`: Whisper model for `--transcribe` (default `base`; `small` is more accurate but slower).
 -   `--vocabulary TEXT_FILE`: With `--transcribe`, a list of names and terms (one per line) that Whisper should spell correctly.
 -   `--debug`: Enable debug printing, which shows detailed metadata (width, height, rotation) for each file processed.
