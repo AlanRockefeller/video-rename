@@ -64,13 +64,23 @@ For example:
 
 `IMG_1234_bear_fishing_2026-10-24_USA_CA_horizontal.mp4`
 
+Tick **B-roll** (or press `Ctrl+B`) to mark a clip as b-roll. `broll` is added
+after the description, for example
+`IMG_1234_forest_floor_broll_2026-10-24_USA_CA_horizontal.mp4`; a b-roll clip
+may be renamed without a description. Files already named this way open with
+the box ticked, and the catalog has a `b_roll` column.
+
 Useful controls:
 
 - `Ctrl+Enter`: rename and go to the next video
 - `Ctrl+Right Arrow`: skip to the next video
 - `Alt+Left/Right Arrow`: seek backward or forward five seconds
-- **Delete…**: permanently delete the current video after confirming its exact
-  filename (`--dry-run` only removes it from the current review)
+- **Delete…**: move the current video to the Trash (Recycle Bin) after
+  confirming its exact filename, so it can be restored later (`--dry-run` only
+  removes it from the current review). Delete uses the
+  [send2trash](https://pypi.org/project/send2trash/) package when installed,
+  otherwise Finder on macOS or `gio trash` on Linux. If none is available the
+  video is left in place and an error is shown; it is never deleted outright.
 - **Open in video player**: use the system player when the browser does not
   support a video's codec
 
@@ -84,6 +94,58 @@ The review server only listens on `127.0.0.1`, validates the local request host,
 requires JSON for every modifying request, and stops when you finish. You can
 combine `--interactive` with `--recursive` or `--dry-run`.
 
+### Suggested descriptions from speech
+
+Add `--transcribe` to have the review screen listen to each video and suggest
+a description from what is said in it:
+
+```bash
+python3 video_rename.py /path/to/videos --interactive --transcribe
+```
+
+The first three minutes of each video's audio are transcribed on your own
+computer with [Whisper](https://github.com/openai/whisper); nothing is uploaded.
+Transcription runs in the background, starting with the video on screen and
+working ahead. Under the description field, **Heard in this clip** shows the
+transcript and a suggestion. The transcript can be edited in place to fix
+misheard words; the edit is saved when the box loses focus or you move on, and
+the suggestion is recalculated from the corrected text. Species names such as *Amanita muscaria* come
+first, followed by the most frequent meaningful words. The suggestion is never
+saved unless you choose it: press **Tab** in an empty description field or
+click the suggestion, then edit it if you like.
+
+Transcripts are cached in `transcripts.json` next to the geocoding cache. They
+are keyed by file content and model, so renamed videos are not transcribed
+again.
+
+Add `--save-transcripts` to also keep each transcript in a text file beside
+its video, named after the whole video filename plus `.txt` (for example
+`IMG_6426_amanita_2023-12-09_vertical.mp4.txt`), so videos that share a base
+name such as `IMG_1.mp4` and `IMG_1.mov` never share a transcript. A file
+saved by an earlier version as `IMG_1.txt` is renamed to the new style the
+next time its video is reviewed or catalogued, unless another video in the
+folder has the same base name. These files can be searched with
+Spotlight or any desktop search, and they stay paired with their video: when a
+video is renamed, its transcript file is renamed too, and deleting a video in
+the review screen moves its transcript file to the Trash with it. Clips with
+fewer than 15 spoken words (`MIN_TRANSCRIPT_WORDS`) get no file, and a text
+file the program did not write is never overwritten, moved or deleted. A
+transcript corrected in the review screen is saved even when it is short, is
+marked "Edited by hand", and is never replaced by a fresh automatic
+transcript; it is also what the catalog uses. Emptying the box moves the
+transcript file to the Trash. Corrections, including an emptied transcript,
+are also remembered in `transcripts.json`, so a clip is not heard again with
+its old mistakes, even without `--save-transcripts`.
+
+Add `--vocabulary words.txt` to help Whisper spell names it would otherwise
+guess at, such as species, places and people. The file has one term per line;
+blank lines and lines starting with `#` are ignored. The terms are given to
+Whisper as a prompt, which only nudges spelling and does not limit what it can
+hear. Whisper reads only the last ~223 tokens of a prompt, which is roughly 600
+characters or 40–50 scientific names, so keep the list short and put the most
+important terms at the end. The program warns when a list is longer. Changing the list gives
+fresh transcripts rather than reusing cached ones.
+
 Location lookup uses OpenStreetMap's Nominatim service conservatively: requests
 are serialized and limited to at most one every 1.1 seconds, nearby coordinates
 share a cache entry, and successful/no-result lookups are persisted at
@@ -96,12 +158,32 @@ or your own instance. Location data is ©
 [OpenStreetMap contributors](https://www.openstreetmap.org/copyright); see the
 [public Nominatim usage policy](https://operations.osmfoundation.org/policies/nominatim/).
 
+## Clip catalog
+
+`--catalog` writes a spreadsheet (CSV) describing every video and renames
+nothing:
+
+```bash
+python3 video_rename.py /path/to/videos --recursive --catalog clips.csv
+```
+
+Columns: `path`, `filename`, `description`, `date`, `location`, `orientation`,
+`duration`, `duration_seconds`, `width`, `height` and `size_mb`. With
+`--transcribe`, `suggested_description` and `transcript` columns are added,
+which makes clips searchable by what was said in them. The file opens directly
+in Excel, Numbers or Google Sheets. Locations are looked up with the same
+rate-limited, cached geocoding as renaming, so the first catalog of a large,
+GPS-tagged collection takes about a second per new place.
+
 ## Requirements
 
 - Python 3.7+
 - `exiftool`: This must be installed and accessible in your system's PATH. You can find installation instructions at [exiftool.org](https://exiftool.org/install.html).
 - `ffmpeg` and `ffprobe`: Optional, but recommended for browser-compatible audio previews.
 - `geopy` Python library.
+- For `--transcribe` only: FFmpeg and a Whisper speech recognizer, either
+  `pip install faster-whisper` (recommended; fast on a CPU) or
+  `pip install openai-whisper`. The chosen model is downloaded on first use.
 
 ## Installation
 
@@ -133,6 +215,11 @@ python3 video_rename.py [PATHS...] [OPTIONS]
 -   `--dry-run`: Print the proposed renames without actually changing any files. This is highly recommended for the first run.
 -   `-i`, `--interactive`: Open the video review screen and add descriptions.
 -   `--include-described`: Also show videos that already appear to have a description (interactive mode only).
+-   `--catalog CSV_FILE`: Write a spreadsheet listing every video instead of renaming. Cannot be combined with `--interactive` or `--dry-run`.
+-   `--transcribe`: Transcribe speech locally to suggest descriptions (`--interactive`) or add transcript columns (`--catalog`).
+-   `--save-transcripts`: With `--transcribe`, also save each transcript as a searchable text file beside its video (`IMG_1.mp4` → `IMG_1.mp4.txt`).
+-   `--whisper-model NAME`: Whisper model for `--transcribe` (default `base`; `small` is more accurate but slower).
+-   `--vocabulary TEXT_FILE`: With `--transcribe`, a list of names and terms (one per line) that Whisper should spell correctly.
 -   `--debug`: Enable debug printing, which shows detailed metadata (width, height, rotation) for each file processed.
 
 ## Examples
@@ -151,6 +238,16 @@ python3 video_rename.py "/path/to/my/video_001.mp4"
 #### Interactively describe videos in a directory tree
 ```bash
 python3 video_rename.py /path/to/videos --recursive --interactive
+```
+
+#### Interactively describe videos with suggestions from what is said
+```bash
+python3 video_rename.py /path/to/videos --recursive --interactive --transcribe
+```
+
+#### Make a spreadsheet of every clip, including transcripts
+```bash
+python3 video_rename.py /path/to/videos --recursive --catalog clips.csv --transcribe
 ```
 
 #### Rename multiple specific files
