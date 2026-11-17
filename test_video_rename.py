@@ -2633,12 +2633,18 @@ class TestSpeciesNameCorrection:
         )
 
 
+@pytest.fixture(scope="module")
+def included_species():
+    """The species list that comes with the program, loaded once."""
+    return video_rename.load_species_list(video_rename.DEFAULT_SPECIES_LIST)
+
+
 class TestSpeciesCorrectionOnRealNarration:
     """Cases from real field narration and ordinary English, with the included list."""
 
-    @pytest.fixture(scope="class")
-    def species(self):
-        return video_rename.load_species_list(video_rename.DEFAULT_SPECIES_LIST)
+    @pytest.fixture
+    def species(self, included_species):
+        return included_species
 
     @pytest.mark.parametrize(
         "heard, expected",
