@@ -70,6 +70,11 @@ after the description, for example
 may be renamed without a description. Files already named this way open with
 the box ticked, and the catalog has a `b_roll` column.
 
+Tick **Vlog** (or press `Ctrl+L`) the same way to add a `vlog` tag, for
+example `IMG_1234_morning_walk_vlog_2026-10-24_USA_CA_vertical.mp4`. When both
+boxes are ticked the name ends in `_broll_vlog`, and the catalog has a `vlog`
+column.
+
 Useful controls:
 
 - `Ctrl+Enter`: rename and go to the next video

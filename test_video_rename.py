@@ -2024,6 +2024,82 @@ class TestBroll:
         assert 'type="checkbox" id="broll"' in _INTERACTIVE_HTML
 
 
+class TestVlog:
+    @pytest.mark.parametrize(
+        "text, expected",
+        [
+            ("cooking dinner vlog", ("cooking dinner", False, True)),
+            ("cooking_dinner_VLOG", ("cooking_dinner", False, True)),
+            ("vlog", ("", False, True)),
+            ("forest broll vlog", ("forest", True, True)),
+            ("forest vlog broll", ("forest", True, True)),
+            ("forest broll", ("forest", True, False)),
+            ("vlogging gear", ("vlogging gear", False, False)),
+            ("photovlog", ("photovlog", False, False)),
+        ],
+    )
+    def test_split_tags(self, text, expected):
+        assert video_rename._split_tags(text) == expected
+
+    def test_name_gets_vlog_after_the_description(self, tmp_path):
+        path = _build_descriptive_path(
+            tmp_path / "IMG_1.mp4",
+            "morning walk",
+            "2026-11-19",
+            "USA_CA",
+            "vertical",
+            "IMG_1",
+            vlog=True,
+        )
+        assert path.name == "IMG_1_morning_walk_vlog_2026-11-19_USA_CA_vertical.mp4"
+
+    def test_broll_and_vlog_together(self, tmp_path):
+        path = _build_descriptive_path(
+            tmp_path / "IMG_1.mp4",
+            "forest vlog",
+            None,
+            None,
+            "vertical",
+            "IMG_1",
+            broll=True,
+        )
+        assert path.name == "IMG_1_forest_broll_vlog_vertical.mp4"
+
+    def test_vlog_alone_is_enough_to_rename(self, tmp_path):
+        path = _build_descriptive_path(
+            tmp_path / "IMG_1.mp4", "", None, None, "vertical", "IMG_1", vlog=True
+        )
+        assert path.name == "IMG_1_vlog_vertical.mp4"
+
+    def test_rename_records_vlog(self, tmp_path):
+        video = tmp_path / "IMG_1234_horizontal.mp4"
+        video.write_bytes(b"a")
+        handler = TestInteractiveRename._handler()
+        item = TestInteractiveRename._item(video)
+
+        handler._rename(item, "Rainy forest", vlog=True)
+
+        assert item["path"].name.startswith("IMG_1234_Rainy_forest_vlog")
+        assert item["description"] == "Rainy forest"
+        assert item["vlog"] is True
+        assert item["broll"] is False
+
+    def test_existing_vlog_name_ticks_the_box(self, tmp_path):
+        video = tmp_path / "IMG_1234_moss_broll_vlog_horizontal.mp4"
+        item = _prepare_review_item(video, 0, skip_metadata_if_described=True)
+        assert item["description"] == "moss"
+        assert item["broll"] is True
+        assert item["vlog"] is True
+        assert video_rename._public_review_item(item)["vlog"] is True
+
+    def test_review_page_has_a_vlog_checkbox(self):
+        assert 'type="checkbox" id="vlog"' in _INTERACTIVE_HTML
+        assert "previousVlog" in _INTERACTIVE_HTML
+
+    def test_catalog_has_a_vlog_column(self):
+        assert "vlog" in video_rename.CATALOG_FIELDS
+
+
 class TestSameStemVideos:
     def test_each_video_gets_its_own_transcript_file(self, tmp_path):
         mp4, mov = tmp_path / "IMG_1.mp4", tmp_path / "IMG_1.mov"
