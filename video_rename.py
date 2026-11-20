@@ -625,6 +625,29 @@ def _split_broll(description):
     return description[: match.start()].strip(" _-"), True
 
 
+VLOG_TOKEN = "vlog"
+_VLOG_SUFFIX_RE = re.compile(r"(?:^|[\s_-]+)vlog$", re.IGNORECASE)
+
+
+def _split_tags(description):
+    """Return (description, is_broll, is_vlog), removing trailing tags.
+
+    The "broll" and "vlog" tags may appear in either order at the end.
+    """
+    description = (description or "").strip()
+    broll = vlog = False
+    while True:
+        description, found_broll = _split_broll(description)
+        match = _VLOG_SUFFIX_RE.search(description)
+        found_vlog = bool(match)
+        if match:
+            description = description[: match.start()].strip(" _-")
+        if not (found_broll or found_vlog):
+            return description, broll, vlog
+        broll = broll or found_broll
+        vlog = vlog or found_vlog
+
+
 def _build_descriptive_path(
     file_path,
     description,
@@ -633,13 +656,19 @@ def _build_descriptive_path(
     orientation,
     base_stem="",
     broll=False,
+    vlog=False,
 ):
     """Build the canonical interactive filename from its useful components."""
-    description, typed_broll = _split_broll(description)
+    description, typed_broll, typed_vlog = _split_tags(description)
     broll = broll or typed_broll
+    vlog = vlog or typed_vlog
     safe_description = "_".join(
         part
-        for part in (_sanitize_description(description), BROLL_TOKEN if broll else "")
+        for part in (
+            _sanitize_description(description),
+            BROLL_TOKEN if broll else "",
+            VLOG_TOKEN if vlog else "",
+        )
         if part
     )
     if not safe_description:
@@ -1747,6 +1776,7 @@ CATALOG_FIELDS = (
     "filename",
     "description",
     "b_roll",
+    "vlog",
     "date",
     "location",
     "orientation",
@@ -1793,7 +1823,7 @@ def build_catalog_row(
     _base_stem, description = _description_parts(
         file_path.stem, date_str, location_str, orientation
     )
-    description, broll = _split_broll(description)
+    description, broll, vlog = _split_tags(description)
     seconds = _duration_seconds(exif_data)
     try:
         size_mb = round(file_path.stat().st_size / (1024 * 1024), 1)
@@ -1812,6 +1842,7 @@ def build_catalog_row(
         "filename": file_path.name,
         "description": description,
         "b_roll": "yes" if broll else "",
+        "vlog": "yes" if vlog else "",
         "date": date_str or "",
         "location": location_str or "",
         "orientation": orientation,
@@ -1974,6 +2005,7 @@ _INTERACTIVE_HTML = r"""<!doctype html>
         <label class="label" for="description">Description</label>
         <input id="description" autocomplete="off" maxlength="160" placeholder="What happens in this video?">
         <label class="check"><input type="checkbox" id="broll"> B-roll <small>(adds “broll” to the name)</small></label>
+        <label class="check"><input type="checkbox" id="vlog"> Vlog <small>(adds “vlog” to the name)</small></label>
       </div>
       <div class="row" id="suggestion-row" hidden>
         <div class="label">Heard in this clip</div>
@@ -1988,7 +2020,7 @@ _INTERACTIVE_HTML = r"""<!doctype html>
         <button type="button" class="primary" id="save">Rename &amp; next</button>
         <button type="button" class="danger" id="delete">Delete…</button>
         <button type="button" id="finish">Finish</button>
-        <span class="hint">Ctrl+Enter rename · Ctrl+→ skip · Ctrl+B b-roll · Alt+←/→ seek</span>
+        <span class="hint">Ctrl+Enter rename · Ctrl+→ skip · Ctrl+B b-roll · Ctrl+L vlog · Alt+←/→ seek</span>
       </div>
       <div id="message" role="alert"></div>
     </div>
@@ -2026,10 +2058,16 @@ function containsDate(text, date) {
   return false;
 }
 const brollSuffix = /(?:^|[\s_-]+)b[\s_-]?roll$/i;
-function proposedName(item, description, broll = $('broll').checked) {
-  let text = description.trim();
-  if (brollSuffix.test(text)) { text = text.replace(brollSuffix, ''); broll = true; }
-  const clean = [cleanDescription(text), broll ? 'broll' : ''].filter(Boolean).join('_') || '[description]';
+const vlogSuffix = /(?:^|[\s_-]+)vlog$/i;
+function proposedName(item, description, broll = $('broll').checked, vlog = $('vlog').checked) {
+  let text = description.trim(), found = true;
+  // The "broll" and "vlog" tags may be typed in either order at the end.
+  while (found) {
+    found = false;
+    if (brollSuffix.test(text)) { text = text.replace(brollSuffix, '').trim(); broll = found = true; }
+    if (vlogSuffix.test(text)) { text = text.replace(vlogSuffix, '').trim(); vlog = found = true; }
+  }
+  const clean = [cleanDescription(text), broll ? 'broll' : '', vlog ? 'vlog' : ''].filter(Boolean).join('_') || '[description]';
   const date = containsDate(`${item.base_stem}_${clean}`, item.date) ? null : item.date;
   return [item.base_stem, clean, date, item.location, item.orientation]
     .filter(Boolean).join('_') + item.extension;
@@ -2038,7 +2076,7 @@ async function ensureLocation(item) {
   if (!item.has_coordinates || item.locationResolved) return;
   if (!item.locationPromise) {
     const previousDescription = item.description || '';
-    const previousBroll = Boolean(item.broll);
+    const previousBroll = Boolean(item.broll), previousVlog = Boolean(item.vlog);
     item.locationAttempted = true;
     item.locationPromise = fetch('/api/geocode', {method:'POST', headers:{'Content-Type':'application/json'},
       body:JSON.stringify({id:item.id})})
@@ -2056,8 +2094,9 @@ async function ensureLocation(item) {
           if (input.value === previousDescription) {
             input.value = item.description || '';
             if (document.activeElement === input) input.select();
-            // The lookup may also find a "broll" tag behind the location.
+            // The lookup may also find a "broll" or "vlog" tag behind the location.
             if ($('broll').checked === previousBroll) $('broll').checked = Boolean(item.broll);
+            if ($('vlog').checked === previousVlog) $('vlog').checked = Boolean(item.vlog);
           }
           $('proposed').textContent = proposedName(item, input.value);
         }
@@ -2175,6 +2214,7 @@ function render() {
   $('current').textContent = item.current_name;
   $('description').value = item.description || '';
   $('broll').checked = Boolean(item.broll);
+  $('vlog').checked = Boolean(item.vlog);
   $('proposed').textContent = proposedName(item, $('description').value);
   $('previous').disabled = position === 0; $('message').textContent = '';
   const video = $('video'); video.pause(); video.src = `/video/${item.id}/browser`; video.load();
@@ -2216,17 +2256,17 @@ async function renameCurrent() {
   if (busy || position >= items.length) return;
   const item = items[position];
   const missing = 'Enter a description, or choose Skip.';
-  const hasName = () => cleanDescription($('description').value) || $('broll').checked;
+  const hasName = () => cleanDescription($('description').value) || $('broll').checked || $('vlog').checked;
   if (!hasName()) { $('message').textContent = missing; return; }
   setBusy(true); $('message').textContent = '';
   try {
     clearTimeout(locationTimer); await ensureLocation(item);
     // Read the description after the lookup, which may have corrected it.
-    const description = $('description').value, broll = $('broll').checked;
+    const description = $('description').value, broll = $('broll').checked, vlog = $('vlog').checked;
     if (!hasName()) throw new Error(missing);
     await flushTranscript();
     const response = await fetch('/api/rename', {method:'POST', headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({id:item.id, description, broll})});
+      body:JSON.stringify({id:item.id, description, broll, vlog})});
     const result = await response.json();
     if (!response.ok) throw new Error(result.error || 'Rename failed');
     Object.assign(item, result.item); setBusy(false); next();
@@ -2294,9 +2334,9 @@ $('description').addEventListener('keydown', event => {
   }
 });
 $('use-suggestion').addEventListener('click', useSuggestion);
-$('broll').addEventListener('change', () => {
+['broll', 'vlog'].forEach(id => $(id).addEventListener('change', () => {
   if (position < items.length) $('proposed').textContent = proposedName(items[position], $('description').value);
-});
+}));
 $('transcript').addEventListener('input', () => {
   if (!transcriptItem) return;
   transcriptDirty = true; showTranscriptStatus(null, 'Unsaved changes; they save when you click away or move on.');
@@ -2327,6 +2367,9 @@ document.addEventListener('keydown', event => {
   else if (event.ctrlKey && !event.metaKey && (event.key === 'b' || event.key === 'B')) {
     event.preventDefault(); $('broll').checked = !$('broll').checked; $('broll').dispatchEvent(new Event('change'));
   }
+  else if (event.ctrlKey && !event.metaKey && (event.key === 'l' || event.key === 'L')) {
+    event.preventDefault(); $('vlog').checked = !$('vlog').checked; $('vlog').dispatchEvent(new Event('change'));
+  }
   else if (editingText) return;
   else if (commandKey && event.key === 'ArrowRight') { event.preventDefault(); next(); }
   else if (event.altKey && (event.key === 'ArrowLeft' || event.key === 'ArrowRight')) {
@@ -2346,6 +2389,7 @@ def _public_review_item(item):
         "base_stem": item["base_stem"],
         "description": item["description"],
         "broll": bool(item.get("broll")),
+        "vlog": bool(item.get("vlog")),
         "date": item["date"],
         "location": item["location"],
         "orientation": item["orientation"],
@@ -2413,13 +2457,16 @@ def _prepare_review_item(
                         f"[DEBUG] file: {file_path.name}, existing description: "
                         f"{quick_description} (metadata skipped)"
                     )
-                quick_description, quick_broll = _split_broll(quick_description)
+                quick_description, quick_broll, quick_vlog = _split_tags(
+                    quick_description
+                )
                 return {
                     "id": item_id,
                     "path": file_path,
                     "base_stem": quick_base,
                     "description": quick_description,
                     "broll": quick_broll,
+                    "vlog": quick_vlog,
                     "described": True,
                     "date": quick_date,
                     "location": None,
@@ -2459,13 +2506,14 @@ def _prepare_review_item(
             f"description: {description or '(none)'}"
         )
     described = bool(description)
-    description, broll = _split_broll(description)
+    description, broll, vlog = _split_tags(description)
     return {
         "id": item_id,
         "path": file_path,
         "base_stem": base_stem,
         "description": description,
         "broll": broll,
+        "vlog": vlog,
         "described": described,
         "date": date_str,
         "location": location_str,
@@ -2881,7 +2929,10 @@ class _ReviewRequestHandler(BaseHTTPRequestHandler):
                 self._send_json({"ok": True, "dry_run": self.server.dry_run})
                 return
             self._rename(
-                item, request.get("description", ""), bool(request.get("broll"))
+                item,
+                request.get("description", ""),
+                bool(request.get("broll")),
+                bool(request.get("vlog")),
             )
         except (TypeError, ValueError, OSError) as exc:
             self._send_json({"error": str(exc)}, 400)
@@ -2902,11 +2953,13 @@ class _ReviewRequestHandler(BaseHTTPRequestHandler):
                 location_str,
                 item["orientation"],
             )
-            item["description"], item["broll"] = _split_broll(description)
+            item["description"], item["broll"], item["vlog"] = _split_tags(
+                description
+            )
             public_item = _public_review_item(item)
         self._send_json({"ok": True, "item": public_item, "definitive": definitive})
 
-    def _rename(self, item, description, broll=False):
+    def _rename(self, item, description, broll=False, vlog=False):
         if not isinstance(description, str):
             raise TypeError("Description must be text.")
         old_path = item["path"]
@@ -2918,6 +2971,7 @@ class _ReviewRequestHandler(BaseHTTPRequestHandler):
             item["orientation"],
             item["base_stem"],
             broll=broll,
+            vlog=vlog,
         )
         # Compare as text so a capitalization-only change still counts as a
         # rename on Windows, and accept it on case-insensitive filesystems
@@ -2930,8 +2984,9 @@ class _ReviewRequestHandler(BaseHTTPRequestHandler):
                 old_path.rename(new_path)
                 item["path"] = new_path
                 _move_transcript_file(old_path, new_path)
-            item["description"], typed_broll = _split_broll(description)
+            item["description"], typed_broll, typed_vlog = _split_tags(description)
             item["broll"] = broll or typed_broll
+            item["vlog"] = vlog or typed_vlog
         prefix = "[DRY]" if self.server.dry_run else "[RENAME]"
         print(f"{prefix} {old_path.name} → {new_path.name}")
         public_item = _public_review_item(item)

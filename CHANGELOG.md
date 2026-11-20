@@ -47,6 +47,9 @@ commit date rather than release tag; the `v1.2` tag covers the 2026-10-24 and
 - Added a **B-roll** checkbox (`Ctrl+B`) to the review screen that adds a
   `broll` tag after the description in the new name, and a `b_roll` column to
   the catalog.
+- Added a **Vlog** checkbox (`Ctrl+L`) that works like the B-roll one: it adds
+  a `vlog` tag after the description (after `broll` when both are ticked) and
+  a `vlog` column to the catalog.
 
 ### Changed
 
